@@ -10,10 +10,13 @@ from string import Template
 TEMPLATE_DIR = Path(__file__).parent
 
 ASSESSOR = "assessor"
+ASSESSOR_TOPICS = "assessor_topics"
+ASSESSOR_PROFILE = "assessor_profile"
 PLANNER = "planner"
 TUTOR = "tutor"
 JUDGE = "judge"
 COMPRESSOR = "compressor"
+REVIEWER = "reviewer"
 
 
 def load_template(name: str) -> Template:

@@ -124,6 +124,17 @@ class AssessmentProfile(BaseModel):
     suggested_start_node: str = Field(min_length=1)
 
 
+class AssessmentTopics(BaseModel):
+    """测评开始时的子领域推导 + 第一个问题（FR-201）。
+
+    刻意把"推导子领域"与"问第一个问题"合并成一次调用：分两次调用会让第一问与子领域列表
+    出现不一致（模型可能先列出 A/B/C，再问一个不在列表里的问题），而用户能直接看到这个不一致。
+    """
+
+    topics: list[str] = Field(min_length=1, max_length=8)
+    first_question: str = Field(min_length=1)
+
+
 # --------------------------------------------------------------------------- #
 # 学习路径（FR-302）
 # --------------------------------------------------------------------------- #

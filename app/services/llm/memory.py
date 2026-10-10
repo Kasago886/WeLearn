@@ -89,6 +89,24 @@ def read_text(message: ProtocolMessage, key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def set_leading_system(memory: "Memory", content: str) -> bool:
+    """就地替换**首条** system 消息的内容；不存在时返回 False。
+
+    为什么需要它：``RoundExecutor`` 只在记忆为空时注入 system 提示，所以在"记忆里已经
+    有内容"的后续轮次里，per-turn 变化的提示（例如"本轮聚焦某个子领域"）就无法通过
+    ``system_prompt`` 参数传入。而**追加**一条 system 消息又不可靠——官方 `GET /models`
+    明确区分了两种语义：`leading-only`（只有开头那条生效）与 `in-history`（最新的覆盖先前的）。
+    改写开头那条在两种语义下都生效。
+    """
+    with memory.lock:
+        for round_ in memory._rounds:
+            for envelope in round_.messages:
+                if has_role(envelope.data, ROLE_SYSTEM):
+                    envelope.data[CONTENT_KEY] = content
+                    return True
+    return False
+
+
 class MessageEnvelope:
     """协议载荷 + 我们自己的元信息。"""
 
