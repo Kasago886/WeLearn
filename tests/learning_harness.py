@@ -28,6 +28,7 @@ class LearningHarness:
     state: SessionStateService
     subjects: SubjectService
     sessions: ConversationSessionFactory
+    policy: ModelPolicy
     subjects_created: list[str] = field(default_factory=list)
 
     def new_subject(self, title: str = "贝叶斯定理", **kwargs: object) -> str:
@@ -63,4 +64,5 @@ def make_harness(
         state=state,
         subjects=subjects,
         sessions=sessions,
+        policy=resolved_policy,
     )

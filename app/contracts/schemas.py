@@ -156,10 +156,16 @@ class PathNodeDraft(BaseModel):
     prerequisites: list[str] = Field(default_factory=list)
     key_points: list[str] = Field(min_length=3, max_length=6)
     checkpoints: list[CheckpointDraft] = Field(min_length=1)
+    is_quick_review: bool = False
+    """该节点是否为"快速复习"（画像中已熟练的内容压缩而来，FR-303）。"""
 
 
 class LearningPathDraft(BaseModel):
-    """学习路径。节点数落在配置区间内（默认 3~15，FR-301）。"""
+    """学习路径。节点数落在配置区间内（默认 3~15，FR-301）。
+
+    ``rationale`` 是给用户看的"为什么这样安排"（FR-308）：它把路径与画像的对应关系讲清楚，
+    否则用户看到一个节点列表完全无法判断是否合理。
+    """
 
     rationale: str = Field(min_length=1)
     nodes: list[PathNodeDraft] = Field(min_length=3, max_length=15)
