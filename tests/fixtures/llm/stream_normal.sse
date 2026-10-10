@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"用户问的是贝叶斯定理。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"贝叶斯定理"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"用先验概率与新证据"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"更新后验概率。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":36,"total_tokens":60,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":24,"completion_tokens_details":{"reasoning_tokens":12}}}
+
+data: [DONE]

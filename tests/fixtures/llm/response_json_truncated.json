@@ -1,0 +1,25 @@
+{
+  "id": "chatcmpl-4",
+  "object": "chat.completion",
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"compressed_context\": \"早期对话讲到贝叶斯"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 900,
+    "completion_tokens": 512,
+    "total_tokens": 1412,
+    "prompt_cache_hit_tokens": 512,
+    "prompt_cache_miss_tokens": 388,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}

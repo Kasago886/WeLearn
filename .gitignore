@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# 本地配置与密钥（NFR-108：密钥与本地配置永不入库）
+.env
+.env.local
+*.key
+secret.key
+
+# 运行时数据（SQLite 与日志，D3：可配置到项目外）
+data/
+Logs/
+logs/
+*.log
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

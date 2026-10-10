@@ -1,0 +1,27 @@
+{
+  "id": "chatcmpl-2",
+  "object": "chat.completion",
+  "created": 1750000000,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "贝叶斯定理用先验概率与新证据更新后验概率。",
+        "reasoning_content": "先给定义，再补一个例子。"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 42,
+    "total_tokens": 60,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 18,
+    "completion_tokens_details": {
+      "reasoning_tokens": 21
+    }
+  }
+}
