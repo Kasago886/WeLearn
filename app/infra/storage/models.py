@@ -1,15 +1,15 @@
 """SQLAlchemy 表模型（T0.6 数据库契约的代码部分）。
 
-本文件只包含 **P0/P1 需要落库的实体**；学习领域实体（subject / assessment /
-learning_path / knowledge_point / checkpoint / answer_record / weak_point / study_note）
-在 P2 落地时按需求规格说明书第 6 章补入本文件。
+v1：设置、密钥、会话记忆、用量（P0/P1）。
+**v2（P2）**：学习领域实体 —— subject / session_state / assessment / assessment_level /
+learning_path / knowledge_point / checkpoint / answer_record / weak_point / study_note。
 
 时间戳约定：统一存 **UTC**，展示时再转本地时区（SRS 第 6 章）。
 """
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -136,3 +136,172 @@ class UsageRecordRow(Base):
     reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+# --------------------------------------------------------------------------- #
+# v2：学习领域表（P2）
+# --------------------------------------------------------------------------- #
+
+
+class SubjectRow(Base):
+    """学习主题 = 一个独立的学习空间（FR-101~FR-106）。"""
+
+    __tablename__ = "subject"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    goal: Mapped[str | None] = mapped_column(Text)
+    background: Mapped[str | None] = mapped_column(Text)
+    depth: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class SessionStateRow(Base):
+    """会话状态机（FR-410）。
+
+    ``pending_checkpoint_id`` / ``pending_question`` 是"刷新后恢复到待回答的检查点"的关键字段：
+    没有它们就只能恢复到最后一条消息，无法知道"系统正在等用户回答哪一个问题"。
+    """
+
+    __tablename__ = "session_state"
+
+    subject_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    state: Mapped[str] = mapped_column(String(24))
+    current_node_id: Mapped[str | None] = mapped_column(String(36))
+    pending_checkpoint_id: Mapped[str | None] = mapped_column(String(36))
+    pending_question: Mapped[str | None] = mapped_column(Text)
+    node_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    taught_node_id: Mapped[str | None] = mapped_column(String(36))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AssessmentRow(Base):
+    """知识基础确认（FR-201~FR-208）。"""
+
+    __tablename__ = "assessment"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_turns: Mapped[int] = mapped_column(Integer, default=6)
+    topics_json: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str | None] = mapped_column(Text)
+    suggested_start_node: Mapped[str | None] = mapped_column(Text)
+    skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AssessmentLevelRow(Base):
+    """画像明细：子领域 × 掌握水平（FR-206）。"""
+
+    __tablename__ = "assessment_level"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assessment_id: Mapped[str] = mapped_column(
+        ForeignKey("assessment.id", ondelete="CASCADE"), index=True
+    )
+    topic: Mapped[str] = mapped_column(String(120))
+    level: Mapped[str] = mapped_column(String(16))
+    evidence: Mapped[str] = mapped_column(Text)
+    user_overridden: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class LearningPathRow(Base):
+    """学习路径（FR-301~FR-308）。同一主题可保留多个版本，但只有一个 active。"""
+
+    __tablename__ = "learning_path"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    model: Mapped[str | None] = mapped_column(String(120))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class KnowledgePointRow(Base):
+    """知识点 / 教学节点（FR-302、FR-309）。"""
+
+    __tablename__ = "knowledge_point"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    path_id: Mapped[str] = mapped_column(ForeignKey("learning_path.id", ondelete="CASCADE"), index=True)
+    order_index: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200))
+    objective: Mapped[str] = mapped_column(Text, default="")
+    prerequisites_json: Mapped[str | None] = mapped_column(Text)
+    key_points_json: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(24), default="not_started", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    is_quick_review: Mapped[bool] = mapped_column(Boolean, default=False)
+    mastered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    summary_note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (Index("ix_knowledge_point_path_order", "path_id", "order_index"),)
+
+
+class CheckpointRow(Base):
+    """检查点：必须可判定，因此必须有判定要点与参考答案（FR-302）。"""
+
+    __tablename__ = "checkpoint"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("knowledge_point.id", ondelete="CASCADE"), index=True)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    question: Mapped[str] = mapped_column(Text)
+    expected_points_json: Mapped[str | None] = mapped_column(Text)
+    reference_answer: Mapped[str] = mapped_column(Text, default="")
+
+
+class AnswerRecordRow(Base):
+    """作答与判定记录（FR-404、FR-802）。"""
+
+    __tablename__ = "answer_record"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    node_id: Mapped[str] = mapped_column(String(36), index=True)
+    checkpoint_id: Mapped[str | None] = mapped_column(String(36))
+    question: Mapped[str] = mapped_column(Text, default="")
+    user_answer: Mapped[str] = mapped_column(Text, default="")
+    verdict: Mapped[str] = mapped_column(String(16))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    feedback: Mapped[str] = mapped_column(Text, default="")
+    hit_points_json: Mapped[str | None] = mapped_column(Text)
+    missing_points_json: Mapped[str | None] = mapped_column(Text)
+    attempt_index: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class WeakPointRow(Base):
+    """薄弱点（FR-502~FR-504）。"""
+
+    __tablename__ = "weak_point"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    node_id: Mapped[str] = mapped_column(String(36), index=True)
+    reason: Mapped[str] = mapped_column(String(32))
+    fail_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class StudyNoteRow(Base):
+    """节点笔记（FR-801）。"""
+
+    __tablename__ = "study_note"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    node_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(16), default="auto")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

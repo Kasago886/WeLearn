@@ -16,8 +16,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 1
-"""当前表结构版本。改表结构时递增，并在 :func:`Database.init` 中补充升级逻辑。"""
+SCHEMA_VERSION = 2
+"""当前表结构版本。
+
+v1：设置、密钥、会话记忆、用量（P0/P1）。
+v2：学习领域表（主题、会话状态、测评、路径、知识点、检查点、作答、薄弱点、笔记）。
+
+升级策略：只做"新增表"，因此 :meth:`Database.init` 里的 ``create_all`` 即可完成迁移
+（SQLite 对新增表无需 ALTER）。将来若要改列，再引入真正的迁移步骤（见实施计划待决策项 E2）。
+"""
 
 
 class Database:

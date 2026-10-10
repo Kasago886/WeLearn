@@ -54,6 +54,37 @@ class ConversationKind(StrEnum):
     REVIEW = "review"
 
 
+class SubjectState(StrEnum):
+    """主题会话状态机（FR-410、SRS 第 3.5 节）。
+
+    迁移路径：``draft → assessing → path_review → teaching ⇄ paused → completed``。
+    """
+
+    DRAFT = "draft"
+    ASSESSING = "assessing"
+    PATH_REVIEW = "path_review"
+    TEACHING = "teaching"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
+class AssessmentStatus(StrEnum):
+    """测评状态。"""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+
+
+class WeakPointReason(StrEnum):
+    """薄弱点成因（FR-409 的语义区分由此体现）。"""
+
+    PARTIAL = "partial"
+    SKIPPED = "skipped"
+    SHOW_ANSWER = "show_answer"
+    ADVANCED = "advanced"
+
+
 class LlmPurpose(StrEnum):
     """LLM 调用用途，用于按用途选择模型与思考档位（FR-703）。"""
 
