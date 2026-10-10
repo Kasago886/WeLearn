@@ -1,0 +1,7 @@
+{
+  "recorded_at": "2026-10-10T21:32:31",
+  "model": "deepseek-flash",
+  "base_url": "https://api.deepseek.com",
+  "thinking_enabled": true,
+  "reasoning_effort": "high"
+}

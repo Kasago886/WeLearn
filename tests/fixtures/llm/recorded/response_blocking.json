@@ -1,0 +1,28 @@
+{
+  "id": "b9f9705b-6c7b-42b8-8a14-5a0decf5916c",
+  "object": "chat.completion",
+  "created": 1791639148,
+  "model": "deepseek-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "贝叶斯定理是说：你对某件事的初始判断（先验概率），会在看到新证据后按证据的“支持力度”进行调整，得出更新后的判断（后验概率）。简单说就是——**新证据不会凭空改变你的看法，而是根据它有多能区分真假，按比例修正你原本的信念**。"
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 14,
+    "completion_tokens": 70,
+    "total_tokens": 84,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 14
+  },
+  "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+}

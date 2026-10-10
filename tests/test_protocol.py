@@ -1,5 +1,7 @@
 """协议层测试：请求体构建与响应解析（FR-701、FR-705、FR-716、FR-717）。"""
 
+import json
+
 import pytest
 
 from app.infra.deepseek.errors import LlmError, LlmErrorCategory
@@ -169,6 +171,16 @@ def test_parse_blocking_response_allows_empty_content() -> None:
     assert result.content == ""
     assert result.usage is not None
     assert result.usage.completion_tokens == 0
+
+
+def test_truncated_json_sample_is_recognisable() -> None:
+    """截断时必须能被识别（finish_reason=length + JSON 解析失败），以便按 FR-716 重试。"""
+    body = fixture_json("response_json_truncated.json")
+    assert body["choices"][0]["finish_reason"] == "length"
+
+    result = parse_blocking_response(body)
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.content)
 
 
 def test_parse_blocking_response_rejects_missing_choices() -> None:

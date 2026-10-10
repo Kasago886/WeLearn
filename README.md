@@ -38,6 +38,11 @@ Copy-Item .env.example .env   # 填写 WELEARN_API_KEY
 ```powershell
 # 需要 .env 中已配置 WELEARN_API_KEY
 .\.venv\Scripts\python.exe scripts\llm_smoke.py
-# 附带录制响应样本，供离线测试回放（T0.7）
+# 附带录制响应样本，供离线回放（T0.7）
 .\.venv\Scripts\python.exe scripts\llm_smoke.py --record
 ```
+
+未配置 Key 时会给出引导并以退出码 2 退出（便于区分"没配密钥"与"接口故障"）。
+`--record` 会把真实 SSE 流、非流式响应、JSON Output 响应、模型列表与余额写入
+`tests/fixtures/llm/recorded/`；这些样本由 `tests/test_recorded_fixtures.py` 回放验证，
+并强制检查其中不含密钥。
