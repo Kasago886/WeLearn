@@ -131,6 +131,7 @@ def _to_session(row: SessionStateRow) -> SessionSnapshot:
         pending_question=row.pending_question,
         node_attempts=row.node_attempts,
         taught_node_id=row.taught_node_id,
+        awaiting_decision=bool(row.awaiting_decision),
         updated_at=row.updated_at,
     )
 
@@ -444,6 +445,7 @@ class SessionStateRepository:
             "pending_question",
             "node_attempts",
             "taught_node_id",
+            "awaiting_decision",
         }
         unknown = set(fields) - allowed
         if unknown:

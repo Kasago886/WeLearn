@@ -72,6 +72,7 @@ class SessionSnapshot:
     pending_question: str | None = None
     node_attempts: int = 0
     taught_node_id: str | None = None
+    awaiting_decision: bool = False
     updated_at: datetime | None = None
 
     @property
@@ -87,6 +88,11 @@ class SessionSnapshot:
     def node_taught(self) -> bool:
         """当前节点是否已生成过讲解（避免恢复后重复讲一遍）。"""
         return self.current_node_id is not None and self.taught_node_id == self.current_node_id
+
+    @property
+    def needs_user_decision(self) -> bool:
+        """是否正在等用户就"继续重讲 / 看参考答案 / 直接进入下一节点"做出选择（FR-408）。"""
+        return self.awaiting_decision
 
 
 @dataclass(frozen=True)

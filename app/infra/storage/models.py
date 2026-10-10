@@ -164,6 +164,9 @@ class SessionStateRow(Base):
 
     ``pending_checkpoint_id`` / ``pending_question`` 是"刷新后恢复到待回答的检查点"的关键字段：
     没有它们就只能恢复到最后一条消息，无法知道"系统正在等用户回答哪一个问题"。
+
+    ``awaiting_decision`` 记录"重试已耗尽、正在等用户三选一"这一事实。它必须落库而不是靠前端记忆：
+    用户在这里关掉页面再打开，仍然要看到三个选项，而不是被重新讲一遍（FR-408）。
     """
 
     __tablename__ = "session_state"
@@ -175,6 +178,7 @@ class SessionStateRow(Base):
     pending_question: Mapped[str | None] = mapped_column(Text)
     node_attempts: Mapped[int] = mapped_column(Integer, default=0)
     taught_node_id: Mapped[str | None] = mapped_column(String(36))
+    awaiting_decision: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 

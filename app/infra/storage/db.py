@@ -12,19 +12,30 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import Engine, create_engine, event, select
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """当前表结构版本。
 
-v1：设置、密钥、会话记忆、用量（P0/P1）。
-v2：学习领域表（主题、会话状态、测评、路径、知识点、检查点、作答、薄弱点、笔记）。
+- v1：设置、密钥、会话记忆、用量（P0/P1）。
+- v2：学习领域表（主题、会话状态、测评、路径、知识点、检查点、作答、薄弱点、笔记）。
+- v3：``session_state.awaiting_decision``（"正在等用户三选一"必须跨重启可见）。
 
-升级策略：只做"新增表"，因此 :meth:`Database.init` 里的 ``create_all`` 即可完成迁移
-（SQLite 对新增表无需 ALTER）。将来若要改列，再引入真正的迁移步骤（见实施计划待决策项 E2）。
+升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
+
+1. ``create_all`` 建缺失的**表**（新增表无需 ALTER）；
+2. :data:`_COLUMN_UPGRADES` 逐个补齐缺失的**列**（SQLite 的 ``ADD COLUMN`` 支持默认值）。
+
+之所以要显式做第 2 条：``create_all`` 不会修改已存在的表，若只升版本号，
+已有数据库会在访问新列时报 "no such column"。
 """
+
+_COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
+    ("session_state", "awaiting_decision", "BOOLEAN NOT NULL DEFAULT 0"),
+)
 
 
 class Database:
@@ -66,14 +77,43 @@ class Database:
         cursor.close()
 
     def init(self) -> int:
-        """建表并记录 schema 版本，返回当前版本号。"""
+        """建表、补齐缺失的列并记录 schema 版本，返回当前版本号。"""
         Base.metadata.create_all(self._engine)
+        self._upgrade_columns()
 
         with self.session() as session:
             row = session.scalar(select(SchemaVersionRow).where(SchemaVersionRow.version == SCHEMA_VERSION))
             if row is None:
                 session.add(SchemaVersionRow(version=SCHEMA_VERSION, applied_at=utcnow()))
         return SCHEMA_VERSION
+
+    def _upgrade_columns(self) -> list[str]:
+        """把模型里新增、但已有数据库还没有的列补上；返回实际执行的升级描述。
+
+        幂等：列已存在时什么都不做，因此可以每次启动都跑。
+        """
+        applied: list[str] = []
+        with self._engine.begin() as connection:
+            for table, column, ddl in _COLUMN_UPGRADES:
+                if not self._table_exists(connection, table):
+                    continue
+                if column in self._column_names(connection, table):
+                    continue
+                connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                applied.append(f"{table}.{column}")
+        return applied
+
+    @staticmethod
+    def _table_exists(connection: Connection, table: str) -> bool:
+        row = connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).first()
+        return row is not None
+
+    @staticmethod
+    def _column_names(connection: Connection, table: str) -> set[str]:
+        rows = connection.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+        return {str(row[1]) for row in rows}
 
     @contextmanager
     def session(self) -> Iterator[Session]:
