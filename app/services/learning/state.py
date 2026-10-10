@@ -219,6 +219,10 @@ class SessionStateService:
         updated = self._sessions.update(subject_id, node_attempts=snapshot.node_attempts + 1)
         return updated.node_attempts
 
+    def set_attempts(self, subject_id: str, value: int) -> SessionSnapshot:
+        """直接设置尝试次数（用于"判定失败不计入尝试"这类回退场景）。"""
+        return self._sessions.update(subject_id, node_attempts=max(0, value))
+
     # ------------------------------------------------------------------ #
     # 守卫
     # ------------------------------------------------------------------ #

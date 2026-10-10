@@ -11,7 +11,9 @@ from app.services.llm.memory import (
     Memory,
     MessageEnvelope,
     assistant_message,
+    ensure_leading_system,
     get_role,
+    set_leading_system,
     summary_message,
     system_message,
     tool_message,
@@ -216,3 +218,45 @@ def test_round_clone_is_independent() -> None:
 def test_empty_memory_has_no_last_round() -> None:
     with pytest.raises(IndexError):
         _ = Memory().last_round
+
+
+def test_set_leading_system_replaces_first_system_message() -> None:
+    memory = Memory.from_protocol([[system_message("旧提示")], [user_message("u"), assistant_message("a")]])
+
+    assert set_leading_system(memory, "新提示") is True
+
+    messages = memory.outbound_messages()
+    assert messages[0][CONTENT_KEY] == "新提示"
+    assert messages[1][CONTENT_KEY] == "u"
+    assert len(messages) == 3  # 没有新增消息
+
+
+def test_set_leading_system_returns_false_without_system_message() -> None:
+    memory = Memory.from_protocol([[user_message("u")]])
+    assert set_leading_system(memory, "提示") is False
+    assert memory.message_count == 1
+
+
+def test_ensure_leading_system_inserts_when_missing() -> None:
+    """没有 system 消息时必须在最前面插入，否则提示词会被静默丢弃（模型用上一轮的提示）。"""
+    memory = Memory.from_protocol([[user_message("用户消息"), assistant_message("回答")]])
+
+    ensure_leading_system(memory, "本轮提示")
+
+    messages = memory.outbound_messages()
+    assert messages[0][ROLE_KEY] == "system"
+    assert messages[0][CONTENT_KEY] == "本轮提示"
+    assert messages[1][CONTENT_KEY] == "用户消息"
+    # system 必须独占第一轮，之后才是内容轮次
+    assert memory.rounds[0].is_system_round is True
+    assert memory.round_count == 2
+
+
+def test_ensure_leading_system_is_idempotent() -> None:
+    memory = Memory.from_protocol([[user_message("u")]])
+
+    ensure_leading_system(memory, "提示一")
+    ensure_leading_system(memory, "提示二")
+
+    assert memory.message_count == 2  # system + user，没有重复追加
+    assert memory.outbound_messages()[0][CONTENT_KEY] == "提示二"

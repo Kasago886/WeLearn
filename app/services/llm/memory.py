@@ -107,6 +107,25 @@ def set_leading_system(memory: "Memory", content: str) -> bool:
     return False
 
 
+def ensure_leading_system(memory: "Memory", content: str) -> None:
+    """确保记忆的**第一条**消息是内容为 ``content`` 的 system 消息。
+
+    两种情况都要处理：
+
+    - 已有 system 消息 → 就地改写（见 :func:`set_leading_system`）；
+    - 还没有（例如首个轮次先写了 user 消息）→ 在最前面**插入**一个 system 轮次。
+
+    没有这一步就会出现"提示词被静默丢弃"：调用方把提示词传给 ``stream(system_prompt=...)``，
+    但执行器只在记忆为空时使用它，于是模型拿到的其实是**上一轮的**提示词。
+    """
+    if set_leading_system(memory, content):
+        return
+
+    with memory.lock:
+        memory._rounds.insert(0, ChatRound())
+    memory.rounds[0].add(system_message(content))
+
+
 class MessageEnvelope:
     """协议载荷 + 我们自己的元信息。"""
 
