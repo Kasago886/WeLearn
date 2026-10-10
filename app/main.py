@@ -11,8 +11,9 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from app.api import health
+from app.api import health, settings, subjects
 from app.main_context import AppContext, build_context
+from app.services.learning.stack import build_learning_stack
 
 ENV_HOST = "WELEARN_HOST"
 ENV_PORT = "WELEARN_PORT"
@@ -27,6 +28,7 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
         load_dotenv()
 
     context = build_context(env)
+    stack = build_learning_stack(context)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -36,7 +38,10 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
 
     app = FastAPI(title="WeLearn", version="0.1.0", lifespan=lifespan)
     app.state.ctx = context
+    app.state.stack = stack
     app.include_router(health.router)
+    app.include_router(subjects.router)
+    app.include_router(settings.router)
     return app
 
 

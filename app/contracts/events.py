@@ -36,11 +36,35 @@ class SseEventType(StrEnum):
     NODE_STATE = "node_state"
     """节点状态变更。"""
 
+    ASSESSMENT = "assessment"
+    """测评阶段产出：子领域列表 / 掌握度画像 / 已跳过（v1.1 新增）。"""
+
+    PATH = "path"
+    """学习路径生成完成（v1.1 新增）。"""
+
+    OPTIONS = "options"
+    """需要用户做出选择（重试耗尽后的三选一，v1.1 新增）。"""
+
     ERROR = "error"
     """可操作的错误（已分类，不含敏感信息）。"""
 
     DONE = "done"
     """本轮结束，附带用量。"""
+
+
+class AssessmentEventStatus(StrEnum):
+    """``assessment`` 事件的状态。"""
+
+    QUESTION = "question"
+    PROFILE = "profile"
+    SKIPPED = "skipped"
+
+
+class OptionsKind(StrEnum):
+    """需要用户选择的场景。"""
+
+    EXHAUSTED = "exhausted"
+    """单节点重试已耗尽（FR-408）。"""
 
 
 class UsagePayload(BaseModel):
@@ -88,6 +112,64 @@ class ErrorPayload(BaseModel):
 class DonePayload(BaseModel):
     conversation_id: str | None = None
     usage: UsagePayload | None = None
+
+
+class AssessmentLevelPayload(BaseModel):
+    topic: str
+    level: str
+    evidence: str
+    user_overridden: bool = False
+
+
+class AssessmentProfilePayload(BaseModel):
+    levels: list[AssessmentLevelPayload] = Field(default_factory=list)
+    summary: str = ""
+    suggested_start_node: str = ""
+
+
+class AssessmentPayload(BaseModel):
+    """测评阶段产出（FR-201、FR-206、FR-205）。"""
+
+    status: AssessmentEventStatus
+    topics: list[str] = Field(default_factory=list)
+    turn_number: int = 0
+    total_turns: int = 0
+    current_topic: str | None = None
+    profile: AssessmentProfilePayload | None = None
+
+
+class CheckpointPayload(BaseModel):
+    id: str
+    question: str
+
+
+class PathNodePayload(BaseModel):
+    id: str
+    index: int
+    title: str
+    objective: str
+    key_points: list[str] = Field(default_factory=list)
+    state: str
+    is_quick_review: bool = False
+    checkpoints: list[CheckpointPayload] = Field(default_factory=list)
+
+
+class PathPayload(BaseModel):
+    """学习路径（FR-301、FR-308）。"""
+
+    path_id: str
+    version: int
+    rationale: str
+    nodes: list[PathNodePayload] = Field(default_factory=list)
+
+
+class OptionsPayload(BaseModel):
+    """需要用户选择（FR-408）。"""
+
+    kind: OptionsKind
+    choices: list[str] = Field(default_factory=list)
+    message: str = ""
+    directions: list[str] = Field(default_factory=list)
 
 
 class SseFrame(BaseModel):

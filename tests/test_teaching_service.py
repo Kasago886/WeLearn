@@ -400,9 +400,9 @@ async def test_retry_exhaustion_requires_user_decision(context: AppContext) -> N
     snapshot = harness.state.snapshot(subject_id)
     assert snapshot.needs_user_decision is True
     assert snapshot.has_pending_question is False
-    # 节点没有被标为完成
+    # 节点仍在学习中：既没被标为已掌握，也没被标为部分掌握（要等用户决定）
     node = harness.repos.paths.first_node(harness.repos.paths.get_active(subject_id).id)
-    assert node.state is NodeState.NOT_STARTED
+    assert node.state is NodeState.LEARNING
 
 
 async def test_answer_rejected_while_awaiting_decision(context: AppContext) -> None:

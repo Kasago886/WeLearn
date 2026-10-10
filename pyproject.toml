@@ -48,6 +48,10 @@ ignore = [
     "RUF003",
 ]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI 的依赖注入约定俗成写在参数默认值里，不属于可变默认值问题
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Body"]
+
 [tool.mypy]
 python_version = "3.11"
 disallow_untyped_defs = true

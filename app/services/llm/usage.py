@@ -54,13 +54,14 @@ class UsageRecorder:
         usage: TokenUsage | None,
         *,
         conversation_id: str | None = None,
+        subject_id: str | None = None,
     ) -> None:
         """写入一条记录；``usage`` 为空时写入全 0 记录，以保留"这次调用发生过的"事实。"""
         payload = usage or TokenUsage()
         with self._db.session() as session:
             session.add(
                 UsageRecordRow(
-                    subject_id=self._subject_id,
+                    subject_id=subject_id if subject_id is not None else self._subject_id,
                     conversation_id=conversation_id or self._conversation_id,
                     purpose=purpose.value,
                     model=model,

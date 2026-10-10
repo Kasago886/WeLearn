@@ -66,8 +66,21 @@ class FakeLlmClient:
         self.calls: list[RecordedCall] = []
         self.stream_calls = 0
         self.blocking_calls = 0
+        self.max_retries = 2
+        self.timeout_seconds = 60
 
     # ------------------------------------------------------------------ #
+    # 与真实客户端一致的接口（应用启动/关闭与保存设置时会用到）
+    # ------------------------------------------------------------------ #
+
+    def update_policy(self, *, max_retries: int | None = None, timeout_seconds: int | None = None) -> None:
+        if max_retries is not None:
+            self.max_retries = max_retries
+        if timeout_seconds is not None:
+            self.timeout_seconds = timeout_seconds
+
+    async def aclose(self) -> None:
+        """真实客户端会关闭 HTTP 连接池；桩没有资源需要释放。"""
 
     def _record(self, kind: str, **kwargs: Any) -> RecordedCall:
         call = RecordedCall(kind=kind, **kwargs)

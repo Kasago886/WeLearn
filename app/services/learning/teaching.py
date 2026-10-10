@@ -84,6 +84,9 @@ class _Counter(TypedDict):
 
 TERMINAL_NODE_STATES = frozenset({NodeState.MASTERED, NodeState.PARTIAL, NodeState.SKIPPED})
 
+FRESH_NODE_STATES = frozenset({NodeState.NOT_STARTED, NodeState.REVIEW_NEEDED})
+"""尚未开始的节点状态：进入节点时要从这些状态改成 ``learning``（FR-309）。"""
+
 QUESTION_TRANSITION = "\n\n---\n\n**来检验一下你的理解：**\n\n"
 REFERENCE_PREFIX = "**这是参考答案：**\n\n"
 SIMPLIFIED_PREFIX = "\n\n**换个更基础的角度再说一遍：**\n\n"
@@ -245,6 +248,12 @@ class TeachingService:
                 completed=True,
                 node_total=path.node_count,
             )
+
+        # FR-309：进入节点就算"学习中"。不标记的话节点列表会一直显示"未开始"，
+        # 用户看不出自己正在学哪个节点。
+        if node.state in FRESH_NODE_STATES:
+            self._repos.paths.update_node(node.id, state=NodeState.LEARNING)
+            node = self._repos.paths.node(node.id) or node
 
         session = self._sessions.open(subject_id, ConversationKind.TEACH)
         if not self._state.snapshot(subject_id).node_taught:
@@ -426,6 +435,10 @@ class TeachingService:
                 completed=True,
                 **self._counter(path, node),
             )
+
+        # 用户已经决定离开这个节点，会话就落在下一个节点上，避免出现
+        # "node_state 报的是节点 2 但状态接口说当前还在节点 1" 这种互相矛盾的状态。
+        self._state.enter_node(subject_id, next_node)
 
         return TeachingTurn(
             text="好的，我们先进入下一个节点。",
