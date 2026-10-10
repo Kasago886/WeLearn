@@ -15,6 +15,7 @@ from app.infra.redaction import Redactor
 from app.infra.secrets import SecretStore
 from app.infra.settings import AppSettings, SettingsService, resolve_data_dir
 from app.infra.storage.db import Database
+from app.services.llm.repository import MemoryRepository
 
 DATABASE_FILENAME = "welearn.db"
 LOG_DIR_NAME = "logs"
@@ -39,6 +40,7 @@ class AppContext:
     redactor: Redactor
     logger: QueueLogger
     llm: DeepSeekClient
+    memories: MemoryRepository
     env: Mapping[str, str]
 
     @property
@@ -108,5 +110,6 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
         redactor=redactor,
         logger=logger,
         llm=llm,
+        memories=MemoryRepository(db),
         env=source,
     )

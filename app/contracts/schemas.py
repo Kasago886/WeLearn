@@ -129,15 +129,31 @@ class LearningPathDraft(BaseModel):
 
 
 class JudgementResult(BaseModel):
-    """判定结果。`pass` 必须列出用户命中的要点，用于抑制"放水"。"""
+    """判定结果。
+
+    ``hit_points`` 是抑制"放水"的关键：要求模型在判定为 ``pass`` 时**必须列出学习者命中的要点**，
+    写不出来就说明这次回答不该通过（FR-404、FR-405）。判定器会对缺失 ``hit_points`` 的 `pass`
+    自动降级为 `partial`（保守方向），见 `app/services/llm/judge.py`。
+    """
 
     verdict: Verdict
     confidence: float = Field(ge=0.0, le=1.0)
     feedback: str = Field(min_length=1)
+    hit_points: list[str] = Field(default_factory=list)
     missing_points: list[str] = Field(default_factory=list)
 
     def is_pass(self) -> bool:
         return self.verdict is Verdict.PASS
+
+    def to_payload(self) -> dict[str, object]:
+        """转成 SSE 事件的载荷。"""
+        return {
+            "verdict": self.verdict.value,
+            "confidence": self.confidence,
+            "feedback": self.feedback,
+            "hit_points": list(self.hit_points),
+            "missing_points": list(self.missing_points),
+        }
 
 
 # --------------------------------------------------------------------------- #

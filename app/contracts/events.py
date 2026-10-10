@@ -66,6 +66,7 @@ class VerdictPayload(BaseModel):
     verdict: Verdict
     confidence: float
     feedback: str
+    hit_points: list[str] = Field(default_factory=list)
     missing_points: list[str] = Field(default_factory=list)
 
 
