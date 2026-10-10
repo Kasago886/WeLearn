@@ -3,6 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from app.infra.storage.db import SCHEMA_VERSION
 from app.infra.storage.models import ApiKeySecretRow
 from app.main import create_app
 
@@ -19,7 +20,8 @@ def test_health_reports_storage_and_model_config(env: dict[str, str]) -> None:
     assert body["status"] == "ok"
     assert body["problems"] == []
     assert body["storage"]["ok"] is True
-    assert body["storage"]["schema_version"] == 1
+    # 用常量比较，避免每次表结构升版都要改测试
+    assert body["storage"]["schema_version"] == SCHEMA_VERSION
     assert body["model"]["default"] == "deepseek-flash"
     assert body["model"]["pro"] == "deepseek-v4-pro"
     assert body["api_key"] == {"configured": False, "source": "none", "masked": None}
