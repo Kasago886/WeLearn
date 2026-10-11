@@ -295,7 +295,12 @@ export function AssessmentPage() {
   const [problem, setProblem] = useState<string | null>(null)
   const [regenerate, setRegenerate] = useState(false)
 
-  const { data, error, reload } = useResource(() => subjectsApi.assessment(subjectId), [subjectId])
+  const { data, error, reload } = useResource(
+    () => subjectsApi.assessment(subjectId),
+    // 依赖状态机：测评结束时状态会从 assessing 变成 path_review，
+    // 只有把状态纳入依赖，本页才会重新拉取并切到画像视图
+    [subjectId, state.session.state],
+  )
   const assessment = data?.assessment ?? null
 
   // 刷新时保留现有界面：换回骨架屏会把正在流式生成的问题一起丢掉

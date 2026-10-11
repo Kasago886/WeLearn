@@ -791,3 +791,57 @@ def test_health_still_works_with_stack_wired(api: ApiHarness) -> None:
     body = api.client.get("/api/health").json()
     assert body["status"] == "ok"
     assert body["api_key"]["configured"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 验收项（AC）
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_api_key_is_actionable(env: dict[str, str]) -> None:
+    """AC-02：没配 Key 时要给出"缺什么 + 去哪儿配"，且不崩溃、不推进状态机。
+
+    这里刻意不注入桩客户端：要验证的正是真实客户端在缺配置时的行为，
+    而它在发请求**之前**就会拦下来，因此不会产生任何网络调用。
+    """
+    from app.main import create_app
+
+    app = create_app(env)
+    with TestClient(app) as client:
+        created = client.post("/api/subjects", json={"title": "贝叶斯定理"})
+        assert created.status_code == 201
+        subject_id = created.json()["subject"]["id"]
+
+        response = client.post(f"/api/subjects/{subject_id}/assessment/start")
+
+        assert response.status_code == 200  # 流式端点用 error 事件承载业务失败
+        error = events_of(parse_sse(response.text), "error")[0].data
+        assert error["category"] == "config"
+        assert error["retryable"] is False
+        assert "API Key" in response.text
+        # 状态机不该被推进到 assessing
+        assert client.get(f"/api/subjects/{subject_id}/state").json()["session"]["state"] == "draft"
+
+
+def test_partial_verdict_triggers_reteach(api: ApiHarness) -> None:
+    """AC-09：部分通过 → 返回缺失要点，并换角度重讲后再次提问。"""
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+
+    # 桩的 partial 分支：missing_points 非空、hit_points 为空
+    script(api, stream=["换角度再讲一遍。"], blocking=[verdict_json("partial")])
+    events = parse_sse(
+        api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": "答了一半"}).text
+    )
+
+    verdict = events_of(events, "verdict")[0].data
+    assert verdict["verdict"] == "partial"
+    assert verdict["missing_points"] == ["判定要点"]
+    assert "换角度再讲一遍。" in token_text(events)
+    assert "节点 0 的检查点？" in token_text(events)  # 重讲后再次提问
+
+    state = api.client.get(f"/api/subjects/{subject_id}/state").json()
+    assert state["can_answer"] is True  # 可以再答一次
+    assert state["node"]["state"] == "learning"  # 未通过不推进节点状态
+    assert state["needs_decision"] is False  # 还没到重试上限
