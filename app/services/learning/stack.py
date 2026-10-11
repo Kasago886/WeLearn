@@ -7,6 +7,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from app.contracts.schemas import ConversationKind
 from app.infra.settings import AppSettings
 from app.main_context import AppContext
 from app.services.learning.assessment import AssessmentService
@@ -16,7 +17,9 @@ from app.services.learning.session import ConversationSessionFactory
 from app.services.learning.state import SessionStateService
 from app.services.learning.subjects import SubjectService
 from app.services.learning.teaching import TeachingService
+from app.services.llm.memory import visible_messages
 from app.services.llm.policy import ModelPolicy
+from app.services.llm.repository import MemoryRepository
 from app.services.llm.usage import UsageRecorder
 
 
@@ -32,10 +35,22 @@ class LearningStack:
     teaching: TeachingService
     policy: ModelPolicy
     settings_provider: Callable[[], AppSettings]
+    memories: MemoryRepository
 
     def refresh_settings(self, settings: AppSettings) -> None:
         """设置变更后同步用途策略（模型与思考档位）。"""
         self.policy.update_settings(settings)
+
+    def transcript(self, subject_id: str, kind: ConversationKind, *, limit: int | None = None) -> list[dict[str, str]]:
+        """只读取回某用途的对话正文（刷新恢复用）。
+
+        刻意不用 ``ConversationSessionFactory.open``：它是"打开会话"的语义，会顺手建出会话行，
+        而这是一个读接口，不该有副作用。
+        """
+        conversation_id = self.memories.conversation_id_for(subject_id, kind)
+        if conversation_id is None:
+            return []
+        return visible_messages(self.memories.load(conversation_id), limit=limit)
 
 
 def build_learning_stack(ctx: AppContext) -> LearningStack:
@@ -69,4 +84,5 @@ def build_learning_stack(ctx: AppContext) -> LearningStack:
         teaching=teaching,
         policy=policy,
         settings_provider=settings_provider,
+        memories=ctx.memories,
     )

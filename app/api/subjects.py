@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import get_stack, require_subject
 from app.api.serializers import (
+    answer_payload,
     assessment_payload,
     node_payload,
     path_payload,
@@ -40,7 +41,7 @@ from app.contracts.events import (
     VerdictPayload,
     encode_frame,
 )
-from app.contracts.schemas import MasteryLevel, NodeDecision
+from app.contracts.schemas import AssessmentStatus, ConversationKind, MasteryLevel, NodeDecision
 from app.services.learning.entities import KnowledgePoint
 from app.services.learning.planning import PlanningError
 from app.services.learning.stack import LearningStack
@@ -301,12 +302,26 @@ def assessment_skip(subject_id: str, stack: LearningStack = Depends(get_stack)) 
 
 @router.get("/{subject_id}/assessment")
 def assessment_view(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
-    """画像与测评状态（FR-206、FR-208）。"""
+    """画像与测评状态（FR-206、FR-208）。
+
+    测评进行中时额外返回 ``transcript`` 与 ``pending_question``：刷新后必须能重新看到
+    "正在问的那个问题"，否则用户面对着输入框却不知道要答什么（FR-410）。
+    """
     require_subject(stack, subject_id)
     view = stack.assessments.view(subject_id)
     if view is None:
-        return {"assessment": None}
-    return {"assessment": assessment_payload(view.assessment, view.levels)}
+        return {"assessment": None, "transcript": [], "pending_question": None}
+
+    transcript: list[dict[str, str]] = []
+    if view.assessment.status is AssessmentStatus.RUNNING:
+        transcript = stack.transcript(subject_id, ConversationKind.ASSESS)
+    pending = transcript[-1]["content"] if transcript and transcript[-1]["role"] == "assistant" else None
+
+    return {
+        "assessment": assessment_payload(view.assessment, view.levels),
+        "transcript": transcript,
+        "pending_question": pending,
+    }
 
 
 @router.post("/{subject_id}/assessment/level")
@@ -530,9 +545,18 @@ def teach_resume(subject_id: str, stack: LearningStack = Depends(get_stack)) -> 
 
 @router.get("/{subject_id}/teach/current")
 def teach_current(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
-    """教学页当前状态（不产生任何模型调用）。"""
+    """教学页当前状态（不产生任何模型调用）。
+
+    ``answers`` 是当前节点的作答记录：刷新后据此重建判定卡片与作答历史（FR-410）。
+    讲解正文不重放——它可以直接重新生成，而作答记录是用户自己的输入，丢了就真的丢了。
+    """
     require_subject(stack, subject_id)
     view = stack.teaching.view(subject_id)
+    answers = (
+        [answer_payload(record) for record in stack.repos.answers.list_for_node(view.node.id)]
+        if view.node is not None
+        else []
+    )
     return {
         "session": session_payload(
             view.snapshot,
@@ -552,6 +576,7 @@ def teach_current(subject_id: str, stack: LearningStack = Depends(get_stack)) ->
         "node_total": view.node_total,
         "can_answer": view.can_answer,
         "needs_decision": view.needs_decision,
+        "answers": answers,
     }
 
 

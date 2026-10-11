@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from app.services.learning.entities import (
+    AnswerRecord,
     Assessment,
     Checkpoint,
     KnowledgePoint,
@@ -144,6 +145,22 @@ def weak_point_payload(point: WeakPoint) -> dict[str, Any]:
         "fail_count": point.fail_count,
         "last_attempt_at": iso(point.last_attempt_at),
         "resolved": point.resolved,
+    }
+
+
+def answer_payload(record: AnswerRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "node_id": record.node_id,
+        "question": record.question,
+        "answer": record.user_answer,
+        "verdict": record.verdict,
+        "confidence": record.confidence,
+        "feedback": record.feedback,
+        "hit_points": list(record.hit_points),
+        "missing_points": list(record.missing_points),
+        "attempt_index": record.attempt_index,
+        "created_at": iso(record.created_at),
     }
 
 

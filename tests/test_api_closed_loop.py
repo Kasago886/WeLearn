@@ -309,6 +309,9 @@ def test_assessment_completes_with_profile(api: ApiHarness) -> None:
     payload = events_of(events, "assessment")[0].data
     assert payload["status"] == "profile"
     assert payload["profile"]["summary"] == "需要从基础开始。"
+    # 轮次字段必须照实填：前端用它渲染"已考察 n/N"，缺省 0 会显示成 "2/0"
+    assert payload["turn_number"] == TOTAL_TURNS
+    assert payload["total_turns"] == TOTAL_TURNS
 
     body = api.client.get(f"/api/subjects/{subject_id}/assessment").json()
     assert body["assessment"]["status"] == "completed"
@@ -317,6 +320,30 @@ def test_assessment_completes_with_profile(api: ApiHarness) -> None:
     state = api.client.get(f"/api/subjects/{subject_id}/state").json()
     assert state["session"]["state"] == "path_review"
     assert state["session"]["next_action"] == "confirm_path"
+
+
+def test_assessment_transcript_survives_refresh(api: ApiHarness) -> None:
+    """FR-410：刷新后必须能重新看到"正在问的那个问题"与已有的问答。"""
+    subject_id = create_subject(api)
+    script(api, blocking=[TOPICS_JSON], stream=["第二个方面的问题？"])
+    api.client.post(f"/api/subjects/{subject_id}/assessment/start")
+    api.client.post(f"/api/subjects/{subject_id}/assessment/answer", json={"answer": "回答一"})
+
+    body = api.client.get(f"/api/subjects/{subject_id}/assessment").json()
+
+    assert body["pending_question"] == "第二个方面的问题？"
+    assert body["transcript"] == [
+        {"role": "assistant", "content": "先用你自己的话说说它解决什么问题？"},
+        {"role": "user", "content": "回答一"},
+        {"role": "assistant", "content": "第二个方面的问题？"},
+    ]
+
+    # 未开始测评时不给噪声数据
+    fresh = create_subject(api, "另一个概念")
+    empty = api.client.get(f"/api/subjects/{fresh}/assessment").json()
+    assert empty["assessment"] is None
+    assert empty["transcript"] == []
+    assert empty["pending_question"] is None
 
 
 def test_assessment_skip(api: ApiHarness) -> None:
@@ -465,6 +492,27 @@ def test_teach_start_explains_and_asks(api: ApiHarness) -> None:
     current = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()
     assert current["node"]["title"] == "节点 0"
     assert current["checkpoint"]["question"] == "节点 0 的检查点？"
+    assert current["answers"] == []  # 还没有作答记录
+
+
+def test_teach_answers_survive_refresh(api: ApiHarness) -> None:
+    """FR-410：刷新后判定卡片与作答历史要能重建。"""
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    script(api, blocking=[verdict_json("fail")])
+    api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": "错答"})
+
+    current = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()
+    assert current["can_answer"] is True
+    assert len(current["answers"]) == 1
+
+    record = current["answers"][0]
+    assert record["question"] == "节点 0 的检查点？"
+    assert record["answer"] == "错答"
+    assert record["verdict"] == "fail"
+    assert record["missing_points"] == ["判定要点"]
+    assert record["attempt_index"] == 1
 
 
 def test_teach_answer_pass_advances(api: ApiHarness) -> None:

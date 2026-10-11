@@ -25,6 +25,35 @@ Copy-Item .env.example .env   # 填写 WELEARN_API_KEY
 
 健康检查：`GET http://127.0.0.1:8000/api/health`
 
+## 前端（web/）
+
+React 19 + Vite + TypeScript，不依赖 UI 组件库；按页面拆分为主题 / 测评 / 路径 / 教学 / 设置。
+
+```powershell
+cd web
+npm install
+npm run dev          # 开发服务器 http://localhost:5173，/api 自动代理到 127.0.0.1:8000
+npm run build        # tsc -b && vite build
+npm run lint         # oxlint
+```
+
+后端未启动时前端会给出"无法连接到后端服务"的可操作提示，而不是白屏。
+
+### 不开真实额度也能联调
+
+`scripts/dev_stub_server.py` 用假 LLM 起一个**真实**服务端，让整条链路
+（SSE 分帧、事件处理、三选一、刷新恢复）可以零成本反复跑：
+
+```powershell
+# 终端 1
+.\.venv\Scripts\python.exe scripts\dev_stub_server.py
+# 终端 2
+cd web; npm run dev
+```
+
+桩的判定规则是"回答 ≥40 字算通过"，因此可以手动制造
+"未通过 → 换角度重讲 → 重试耗尽 → 三选一"的完整路径。
+
 ## 校验
 
 ```powershell

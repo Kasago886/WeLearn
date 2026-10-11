@@ -336,13 +336,17 @@ class AssessmentService:
         self._state.transition(subject_id, SubjectState.PATH_REVIEW)
         session.persist()
 
+        topics = finished.topics if finished is not None else ()
         self._log.info(f"测评完成并产出画像 subject={subject_id} levels={len(levels)}")
 
         return AssessmentTurn(
             text=profile.summary,
             finished=True,
             profile=profile,
-            topics=finished.topics if finished is not None else (),
+            # 轮次字段照实填：前端拿它渲染"已考察 n/N"，缺省 0 会显示成"2/0"
+            turn_number=len(topics),
+            total_turns=len(topics),
+            topics=topics,
         )
 
     @staticmethod

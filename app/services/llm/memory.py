@@ -312,6 +312,28 @@ class Memory:
         return cls([ChatRound([MessageEnvelope(message) for message in messages]) for messages in rounds])
 
 
+def visible_messages(memory: Memory, *, limit: int | None = None) -> list[dict[str, str]]:
+    """取出可以直接展示给用户的对话（FR-410 的刷新恢复）。
+
+    只保留 ``user`` / ``assistant`` 的正文：system 提示是内部指令，压缩摘要不是用户说过的话，
+    思维链也不该在恢复时重新渲染。``limit`` 为正数时只取最后若干条。
+    """
+    messages: list[dict[str, str]] = []
+    for envelope in memory.envelopes():
+        if envelope.is_summary:
+            continue
+        role = envelope.data.get(ROLE_KEY)
+        if role not in {"user", "assistant"}:
+            continue
+        content = envelope.content.strip()
+        if content:
+            messages.append({"role": role, "content": content})
+
+    if limit is not None and limit > 0:
+        return messages[-limit:]
+    return messages
+
+
 def serialize_model(model: BaseModel) -> str:
     """统一的结构化输出序列化（日志与提示词样例共用）。"""
     return model.model_dump_json(indent=2)
