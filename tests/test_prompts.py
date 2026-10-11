@@ -82,6 +82,16 @@ def test_judge_template_requires_json_output_and_hit_points() -> None:
     assert "不得出现人身评判" in text
 
 
+def test_judge_template_tells_model_the_pass_rule_explicitly() -> None:
+    """Spike B 实测（docs/Spike实测结果.md）：模型会把"还能说得更好"也写进 missing_points，
+    而 `pass` + 非空 `missing_points` 会触发放水守卫降级为 `partial`——
+    结果是答对的人被反复重讲。规则必须写在提示词里，而不能只靠守卫兜底。"""
+    text = render(JUDGE, user_answer="a")
+
+    assert "`missing_points` 必须为空数组" in text
+    assert "不是缺失要点" in text
+
+
 def test_compressor_template_requires_json_output() -> None:
     from app.prompts import COMPRESSOR
     from app.prompts import render as render_prompt

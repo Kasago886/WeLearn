@@ -5,6 +5,7 @@
 - 需求规格：[docs/需求规格说明书.md](docs/需求规格说明书.md)
 - 实施计划：[docs/实施计划.md](docs/实施计划.md)
 - 接口契约：[docs/接口契约.md](docs/接口契约.md)
+- Spike 实测：[docs/Spike实测结果.md](docs/Spike实测结果.md)
 - 设计参考：[ReferenceCode/](ReferenceCode)（C# 实现，仅作参考，不作依赖）
 
 ## 环境准备
@@ -75,3 +76,17 @@ cd web; npm run dev
 `--record` 会把真实 SSE 流、非流式响应、JSON Output 响应、模型列表与余额写入
 `tests/fixtures/llm/recorded/`；这些样本由 `tests/test_recorded_fixtures.py` 回放验证，
 并强制检查其中不含密钥。
+
+## Spike 实测（真实额度）
+
+离线测试证明不了"官方多久返回一次空内容、判定器会不会放水、思考档位值不值"，
+这些要用真实调用抽样（结论见 [docs/Spike实测结果.md](docs/Spike实测结果.md)）：
+
+```powershell
+# 全部跑一遍（约 30 次调用），或只跑其中一个
+.\.venv\Scripts\python.exe scripts\spike_real.py --out docs/Spike实测结果.md
+.\.venv\Scripts\python.exe scripts\spike_real.py --spike b
+```
+
+默认用设置里的 `model_default`（`deepseek-flash`）：Spike 要回答的是"默认配置下表现如何"，
+换个模型测出来的结论对默认用户没有意义。
