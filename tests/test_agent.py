@@ -151,6 +151,54 @@ async def test_failure_after_partial_output_still_does_not_commit() -> None:
     assert memory.is_empty is True
 
 
+async def test_empty_content_does_not_commit() -> None:
+    """只给思维链、正文为空：算失败、不入库。
+
+    真实观测到的失效（2026-10-13：`completion=411 reasoning=411`）。落一条空回复比报错更糟——
+    界面上什么都不显示，用户只会以为卡死了。
+    """
+    client = FakeLlmClient(stream_script=[ScriptedResponse(events=text_events(reasoning="想了很多，但没写正文"))])
+    memory = Memory()
+    before = memory.outbound_messages()
+
+    result = await make_executor(client, memory=memory).stream("问题")
+
+    assert result.error is True
+    assert result.error_category == "empty_content"
+    assert result.retryable is True
+    assert memory.outbound_messages() == before
+    assert memory.round_count == 0
+
+
+async def test_whitespace_only_content_does_not_commit() -> None:
+    """只有空白同样不算正文——否则会落一条"看起来是空的"回复。"""
+    client = FakeLlmClient(stream_script=[ScriptedResponse(events=text_events("  ", "\n\n"))])
+
+    result = await make_executor(client).stream("问题")
+
+    assert result.error is True
+    assert result.error_category == "empty_content"
+
+
+async def test_interrupted_empty_round_is_not_an_error() -> None:
+    """用户自己按了停止、且还没吐出正文：这是主动中断，不是故障。"""
+
+    class StopsBeforeContent(FakeLlmClient):
+        def __init__(self, stop_event: asyncio.Event) -> None:
+            super().__init__()
+            self.stop_event = stop_event
+
+        async def stream_chat(self, **kwargs):  # type: ignore[override]
+            yield StreamEvent(reasoning="刚开始想")
+            self.stop_event.set()
+
+    stop_event = asyncio.Event()
+    result = await make_executor(StopsBeforeContent(stop_event)).stream("问题", stop_event=stop_event)
+
+    assert result.error is False
+    assert result.interrupted is True
+
+
 async def test_timeout_returns_retryable_failure() -> None:
     client = FakeLlmClient(stream_script=[error_response(LlmError.timeout("超时"))])
     result = await make_executor(client).stream("问题")

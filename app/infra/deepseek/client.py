@@ -157,11 +157,19 @@ class DeepSeekClient:
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """流式对话。失败时按 :attr:`LlmError.retryable` 重试，但**仅在尚未产出增量之前**。"""
+        """流式对话。
+
+        重试有两条边界：
+
+        - **正文已经吐出去过就不再重试**（FR-412）：重试会让同一段话在界面上出现两次；
+        - **正文一个字都没有则算失败、可以重试**：思考模式下模型有概率把输出预算全花在
+          思维链上，正文为空。此时用户并没有看到任何正文，重试不会造成重复内容；
+          而如果不重试，就会落一条空回复——界面上什么都不显示，看着像卡死了。
+        """
         attempt = 0
-        emitted = False
 
         while True:
+            content_emitted = False
             try:
                 async for event in self._stream_once(
                     model=model,
@@ -173,19 +181,26 @@ class DeepSeekClient:
                     purpose=purpose,
                     timeout_seconds=timeout_seconds,
                 ):
-                    if not event.is_usage_only:
-                        emitted = True
+                    if event.content:
+                        content_emitted = True
                     yield event
-                return
             except LlmError as exc:
-                if emitted or not exc.retryable or attempt >= self._max_retries:
+                if content_emitted:
                     raise
-                attempt += 1
-                self._log.warning(
-                    f"流式请求失败将重试（第 {attempt}/{self._max_retries} 次）: "
-                    f"category={exc.category.value} detail={exc.detail}"
-                )
-                await self._sleep_backoff(attempt)
+                error = exc
+            else:
+                if content_emitted:
+                    return
+                error = LlmError.empty_content(f"purpose={purpose.value} model={model}")
+
+            if not error.retryable or attempt >= self._max_retries:
+                raise error
+            attempt += 1
+            self._log.warning(
+                f"流式请求失败将重试（第 {attempt}/{self._max_retries} 次）: "
+                f"category={error.category.value} detail={error.detail}"
+            )
+            await self._sleep_backoff(attempt)
 
     async def _stream_once(
         self,

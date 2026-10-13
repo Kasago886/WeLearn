@@ -24,6 +24,7 @@ class LlmErrorCategory(StrEnum):
     NETWORK = "network"
     TIMEOUT = "timeout"
     PROTOCOL = "protocol"
+    EMPTY_CONTENT = "empty_content"
     UNKNOWN = "unknown"
 
 
@@ -98,6 +99,20 @@ class LlmError(Exception):
     def protocol(cls, message: str, detail: str = "") -> "LlmError":
         """响应结构不符合预期（官方 10 分钟未开始推理即断开也归入此类观测）。"""
         return cls(LlmErrorCategory.PROTOCOL, message, retryable=False, detail=detail)
+
+    @classmethod
+    def empty_content(cls, detail: str = "") -> "LlmError":
+        """只输出了思维链、正文为空（可重试）。
+
+        思考模式下模型有概率把输出预算全花在思维链上，正文一个字都不给。实测与
+        ``max_tokens`` 无关（``completion`` 远未顶到上限时也会发生），因此重试是有效的。
+        """
+        return cls(
+            LlmErrorCategory.EMPTY_CONTENT,
+            "模型这次只给出了思考过程、没有给出正文，已自动重试。请再点一次。",
+            retryable=True,
+            detail=detail,
+        )
 
     def to_payload(self) -> dict[str, object]:
         """转成 SSE 错误事件的载荷（FR-906：不含敏感信息）。"""

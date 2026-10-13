@@ -243,6 +243,94 @@ async def test_stream_does_not_retry_after_first_delta(
     assert received == ["已展示一半"]
 
 
+# --------------------------------------------------------------------------- #
+# 空正文：思考模式下模型有概率只给思维链、不给正文
+# --------------------------------------------------------------------------- #
+
+
+def _content_stream(text: str) -> AsyncIterator[StreamEvent]:
+    async def generator() -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(content=text)
+
+    return generator()
+
+
+def _reasoning_only(text: str = "让我想想……") -> AsyncIterator[StreamEvent]:
+    async def generator() -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(reasoning=text)
+
+    return generator()
+
+
+async def test_reasoning_only_reply_is_retried(
+    monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """思维链不算正文：一个字都没给就该重试，否则会落一条空回复。"""
+    attempts = 0
+
+    def fake_stream_once(**_kwargs: object) -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return _reasoning_only()
+        return _content_stream("第二次给出了正文")
+
+    client = make_client(lambda _r: _ok_blocking(), max_retries=2)
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+
+    events = await _collect(client)
+
+    assert attempts == 2
+    assert [e.content for e in events if e.content] == ["第二次给出了正文"]
+
+
+async def test_reasoning_only_reply_raises_empty_content(
+    monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """重试用尽仍是空正文 → 可重试的 empty_content 错误，而不是静默成功。"""
+    attempts = 0
+
+    def fake_stream_once(**_kwargs: object) -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        return _reasoning_only()
+
+    client = make_client(lambda _r: _ok_blocking(), max_retries=2)
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+
+    with pytest.raises(LlmError) as exc:
+        await _collect(client)
+
+    assert attempts == 3  # 首次 + 2 次重试
+    assert exc.value.category is LlmErrorCategory.EMPTY_CONTENT
+    assert exc.value.retryable is True
+
+
+async def test_empty_reply_does_not_block_retry_like_content_does(
+    monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """对照：吐过正文后再失败不重试，只有思维链时允许重试。"""
+    attempts = 0
+
+    def fake_stream_once(**_kwargs: object) -> AsyncIterator[StreamEvent]:
+        async def generator() -> AsyncIterator[StreamEvent]:
+            nonlocal attempts
+            attempts += 1
+            yield StreamEvent(reasoning="先想了想")
+            raise LlmError.network("流中途断开")
+
+        return generator()
+
+    client = make_client(lambda _r: _ok_blocking(), max_retries=1)
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+
+    with pytest.raises(LlmError) as exc:
+        await _collect(client)
+
+    assert attempts == 2  # 思维链不阻止重试
+    assert exc.value.category is LlmErrorCategory.NETWORK
+
+
 async def test_timeout_is_retryable(make_client: ClientFactory) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("官方 10 分钟未开始推理时也会这样断开", request=request)

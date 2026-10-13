@@ -341,6 +341,32 @@ def test_assessment_completes_with_profile(api: ApiHarness) -> None:
     assert state["session"]["next_action"] == "confirm_path"
 
 
+def test_assessment_empty_reply_surfaces_an_error(api: ApiHarness) -> None:
+    """模型只给思维链、正文为空时必须是**错误事件**，不能当成成功。
+
+    真实观测到的失效（2026-10-13）：`completion=411 reasoning=411`，正文一个字都没有。
+    以前这条路径被当成成功——落一条空回复、返回 200，界面上用户提交完回答后什么都不发生，
+    看着像卡死。同样的"空内容"在结构化输出通道早有处理，流式通道一直漏着。
+    """
+    subject_id = create_subject(api)
+    script(api, blocking=[TOPICS_JSON], stream=["第一个方面的问题？"])
+    api.client.post(f"/api/subjects/{subject_id}/assessment/start")
+    script(api, stream=[""])  # 正文为空
+
+    events = parse_sse(
+        api.client.post(f"/api/subjects/{subject_id}/assessment/answer", json={"answer": "我的回答"}).text
+    )
+
+    assert token_text(events) == ""
+    errors = events_of(events, "error")
+    assert errors, [event.type for event in events]
+    assert errors[0].data["category"] == "empty_content"
+    assert errors[0].data["retryable"] is True
+    # 空回复不得落进对话记录，否则刷新后会上来一个空气泡
+    transcript = api.client.get(f"/api/subjects/{subject_id}/assessment").json()["transcript"]
+    assert all(item["content"].strip() for item in transcript), transcript
+
+
 def test_assessment_transcript_survives_refresh(api: ApiHarness) -> None:
     """FR-410：刷新后必须能重新看到"正在问的那个问题"与已有的问答。"""
     subject_id = create_subject(api)

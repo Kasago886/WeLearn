@@ -140,9 +140,25 @@ class RoundExecutor:
             self._log.warning(f"一轮对话被取消，未提交记忆 purpose={purpose.value}")
             raise
 
+        content = "".join(content_parts)
+        if not content.strip():
+            # 用户按了停止、却恰好赶上流自己结束：循环里已经没机会再观察 stop_event，
+            # 这里补判一次。**只在没吐出正文时才补**——回答已经完整给出时不该被标成"未完成"。
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+            else:
+                # 空正文绝不提交：客户端已经为这种情况自动重试过一轮，还能走到这里说明它确实
+                # 什么都没给。落一条空回复比报错更糟——界面上用户看不到任何东西，只会以为卡死。
+                return self._fail(
+                    LlmError.empty_content(f"purpose={purpose.value} model={choice.model}"),
+                    purpose,
+                    choice.model,
+                    usage,
+                )
+
         return self._commit(
             working,
-            "".join(content_parts),
+            content,
             reasoning_parts,
             usage,
             purpose=purpose,
