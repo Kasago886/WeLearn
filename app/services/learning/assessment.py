@@ -216,7 +216,12 @@ class AssessmentService:
         *,
         on_delta: DeltaCallback | None = None,
     ) -> AssessmentTurn:
-        """提交一次测评作答：继续问下一个子领域，或产出画像并结束。"""
+        """提交一次测评作答：继续问下一个子领域，或产出画像并结束。
+
+        **一整轮是"作答 + 下一个问题"的一个整体**，所以作答与轮次计数都推迟到本轮真正成功
+        之后才落库，失败则整体回退。否则用户会卡在半截状态里：作答已经记下、待答问题却是空的
+        （它由对话里最后一条 assistant 消息推出来），提交按钮点不动，只能放弃整次测评。
+        """
         text = (answer or "").strip()
         if not text:
             return AssessmentTurn(
@@ -231,46 +236,57 @@ class AssessmentService:
 
         subject = self._require_subject(subject_id)
         session = self._sessions.open(subject_id, ConversationKind.ASSESS)
-        session.memory.add_round().add(user_message(text))
-        session.persist()
 
-        turn_number = self._repos.assessments.increment_turn(assessment.id)
         topics = assessment.topics
         if not topics:
             # topics 理论上不会丢；真丢了就让测评收敛为"一轮综合考察"，而不是卡死
             topics = (f"{subject.title}的综合理解",)
             self._repos.assessments.set_topics(assessment.id, topics)
+
+        # 按**将要使用**的轮次号计算，真正的 +1 留到成功后（失败不该消耗一个考察方面）
+        turn_number = assessment.turn_count + 1
         covered = min(turn_number, len(topics))
 
+        # 回退要连首条 system 消息一起还原，所以整体深拷贝而不是只记轮次数量
+        memory_before = session.memory.snapshot()
+        session.memory.add_round().add(user_message(text))
+
         if covered >= len(topics):
-            return await self._finish_with_profile(subject_id, assessment.id, session)
+            turn = await self._finish_with_profile(subject_id, assessment.id, session)
+        else:
+            # 每轮就地改写首条 system 消息（见模块文档）
+            set_leading_system(session.memory, self._system_prompt(subject, topics, covered + 1))
+            result = await session.executor.stream("", on_delta=on_delta, purpose=LlmPurpose.ASSESS)
+            if result.ok:
+                turn = AssessmentTurn(
+                    text=result.content,
+                    finished=False,
+                    turn_number=turn_number,
+                    total_turns=len(topics),
+                    current_topic=topics[covered],
+                    topics=topics,
+                    result=result,
+                )
+            else:
+                turn = AssessmentTurn(
+                    result=result,
+                    error_message=result.message,
+                    error_category=result.error_category,
+                    retryable=result.retryable,
+                    turn_number=turn_number,
+                    total_turns=len(topics),
+                    topics=topics,
+                )
 
-        # 每轮就地改写首条 system 消息（见模块文档）
-        set_leading_system(session.memory, self._system_prompt(subject, topics, covered + 1))
+        if not turn.ok:
+            # 整轮回退：作答摘掉、system 消息还原，用户重新提交一次即可（无需重来整次测评）
+            session.memory.replace_with(memory_before)
+            session.persist()
+            return turn
 
-        result = await session.executor.stream("", on_delta=on_delta, purpose=LlmPurpose.ASSESS)
+        self._repos.assessments.increment_turn(assessment.id)
         session.persist()
-
-        if not result.ok:
-            return AssessmentTurn(
-                result=result,
-                error_message=result.message,
-                error_category=result.error_category,
-                retryable=result.retryable,
-                turn_number=turn_number,
-                total_turns=len(topics),
-                topics=topics,
-            )
-
-        return AssessmentTurn(
-            text=result.content,
-            finished=False,
-            turn_number=turn_number,
-            total_turns=len(topics),
-            current_topic=topics[covered],
-            topics=topics,
-            result=result,
-        )
+        return turn
 
     # ------------------------------------------------------------------ #
     # 跳过
@@ -316,7 +332,8 @@ class AssessmentService:
             )
         except StructuredOutputError as exc:
             self._log.warning(f"画像生成失败: {exc.user_message}")
-            # 不移除进行中的测评：用户可以再提交一次作答重试，而不是从头再来
+            # 不移除进行中的测评：调用方会把这一轮整体回退，用户可以再提交一次作答重试，
+            # 而不是从头再来
             return AssessmentTurn(
                 error_message="没能整理出你的掌握情况，请再提交一次作答以重试。",
                 error_category="structured_output",

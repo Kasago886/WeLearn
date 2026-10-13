@@ -16,7 +16,7 @@ from app.services.learning.assessment import (
     AssessmentService,
     build_transcript,
 )
-from app.services.llm.memory import ROLE_KEY
+from app.services.llm.memory import ROLE_KEY, visible_messages
 from tests.learning_harness import make_harness
 from tests.stubs import ScriptedResponse, json_response, text_events
 
@@ -257,6 +257,45 @@ async def test_answer_propagates_llm_failure(context: AppContext) -> None:
     assert harness.repos.assessments.get_running(subject_id) is not None
 
 
+async def test_failed_turn_leaves_the_question_askable_again(context: AppContext) -> None:
+    """失败的一轮必须整轮回退，否则用户会卡住。
+
+    待答问题是由"对话里最后一条 assistant 消息"推出来的。若是把用户的作答留下来，
+    最后一条就变成 user、待答问题为空，提交按钮点不动——用户既看不到问题也重试不了。
+    真实故障（2026-10-13）正是这样：模型返回空正文，用户提交回答后界面毫无反应。
+    """
+    from app.infra.deepseek.errors import LlmError
+
+    harness = make_harness(
+        context,
+        blocking=[json_response(TOPICS_JSON)],
+        stream=[
+            ScriptedResponse(error=LlmError.from_status(503)),  # 第一次作答失败
+            ScriptedResponse(events=text_events("第二个方面的问题？")),  # 重试成功
+        ],
+    )
+    service = build_service(harness)
+    subject_id = harness.new_subject()
+    started = await service.start(subject_id)
+
+    failed = await service.answer(subject_id, "第一次作答（会失败）")
+    assert failed.ok is False
+
+    # 回退到位：失败的那条作答没有留在对话里，最后一条仍是问题本身
+    conversation_id = harness.ctx.memories.conversation_id_for(subject_id, ConversationKind.ASSESS)
+    transcript = visible_messages(harness.ctx.memories.load(conversation_id))
+    assert [item["content"] for item in transcript] == [started.text]
+    # 轮次没有推进：不该因为一次技术故障占掉一个考察方面
+    running = harness.repos.assessments.get_running(subject_id)
+    assert running is not None and running.turn_count == 0
+
+    # 再提交一次就能继续，且这次成功
+    retried = await service.answer(subject_id, "第二次作答")
+    assert retried.ok is True
+    assert retried.turn_number == 1
+    assert retried.current_topic == "关键公式"
+
+
 async def test_profile_failure_keeps_assessment_running(context: AppContext) -> None:
     """画像失败不能让用户从头再测评一遍。"""
     harness = make_harness(
@@ -281,7 +320,8 @@ async def test_profile_failure_keeps_assessment_running(context: AppContext) -> 
     assert turn.retryable is True
     running = harness.repos.assessments.get_running(subject_id)
     assert running is not None
-    assert running.turn_count == 4
+    # 失败的一轮不该占用一个考察方面：否则界面会显示"已考察 4/4"但其实还没完成
+    assert running.turn_count == 3
     # 状态没有推进到 path_review
     assert harness.state.snapshot(subject_id).state is SubjectState.ASSESSING
     # 用户再提交一次即可重试画像（画像调用有重试，因此这里再补两次坏响应）
