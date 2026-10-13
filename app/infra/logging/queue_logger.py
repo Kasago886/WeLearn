@@ -8,6 +8,7 @@
 日志属于旁路设施：任何写入异常都不得冒泡到调用方。
 """
 
+import contextlib
 import queue
 import threading
 import time
@@ -23,6 +24,10 @@ CHANNEL_ERROR = "error"
 _LEVEL_VALUES = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 _DEFAULT_LEVEL = "INFO"
 _MAX_WRITE_RETRIES = 3
+
+# 关停信号：投进队列让后台线程立刻醒来，而不是等它 0.1s 的取队超时。
+_STOP: None = None
+_FLUSH_POLL_SECONDS = 0.005
 
 
 class BoundLogger:
@@ -64,7 +69,7 @@ class QueueLogger:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor or Redactor()
         self._level_value = _LEVEL_VALUES.get(level.upper(), _LEVEL_VALUES[_DEFAULT_LEVEL])
-        self._queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=max_queue)
+        self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=max_queue)
         self._stopping = threading.Event()
         self._dropped = 0
         self._lock = threading.Lock()
@@ -100,11 +105,15 @@ class QueueLogger:
     def _process_queue(self) -> None:
         while True:
             try:
-                channel, text = self._queue.get(timeout=0.1)
+                item = self._queue.get(timeout=0.1)
             except queue.Empty:
                 if self._stopping.is_set() and self._queue.empty():
                     return
                 continue
+            if item is _STOP:
+                self._queue.task_done()
+                return
+            channel, text = item
             try:
                 self._write_record(channel, text)
             finally:
@@ -151,20 +160,25 @@ class QueueLogger:
             pass
 
     def flush(self, timeout: float = 2.0) -> bool:
-        """等待队列排空，返回是否在超时前完成（测试与关停使用）。"""
+        """等待队列排空，返回是否在超时前完成（测试与关停使用）。
+
+        判据是 ``unfinished_tasks`` 而不是 ``queue.empty()``：后台线程是"先取条目、
+        再落盘"的，队列空并不代表已经写完，拿它当判据会虚报成功。
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._queue.empty():
-                time.sleep(0.05)
-                if self._queue.empty():
-                    return True
-            time.sleep(0.02)
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(_FLUSH_POLL_SECONDS)
         return False
 
     def close(self, timeout: float = 2.0) -> None:
         """停止后台线程并尽力排空队列。"""
         self.flush(timeout)
         self._stopping.set()
+        # 投一个关停信号把线程从取队等待里叫醒，否则要白白等满 0.1s 的超时
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(_STOP)
         self._worker.join(timeout=timeout)
         self._report_dropped_if_any()
 

@@ -10,9 +10,11 @@
 
 import asyncio
 import json
+import ssl
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Protocol
 
 import httpx
@@ -40,6 +42,19 @@ from app.infra.redaction import Redactor
 DEFAULT_BACKOFF_SECONDS = 0.5
 CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_TEST_TIMEOUT_SECONDS = 30
+
+
+@lru_cache(maxsize=1)
+def _shared_ssl_context() -> ssl.SSLContext:
+    """复用同一个默认 SSL 上下文。
+
+    ``httpx.AsyncClient()`` 默认会在**每次构造时**重新解析 CA 证书包
+    （本机实测 0.33s，占装配耗时九成以上），而证书包在一个进程的生命周期内不会变，
+    没有理由每个客户端付一次。
+
+    取值方式直接复用 httpx 的公开工厂，不抄它的内部逻辑——httpx 改行为时这里跟着变。
+    """
+    return httpx.create_ssl_context(verify=True)
 
 
 @dataclass(frozen=True)
@@ -106,7 +121,10 @@ class DeepSeekClient:
         self._log_payload = log_payload
         self._log = get_logger(CHANNEL_LLM)
         self._owns_client = http_client is None
-        self._client = http_client or httpx.AsyncClient(follow_redirects=True)
+        self._client = http_client or httpx.AsyncClient(
+            follow_redirects=True,
+            verify=_shared_ssl_context(),
+        )
 
     # ------------------------------------------------------------------ #
     # 生命周期
