@@ -174,6 +174,8 @@ export interface TeachingView {
   can_answer: boolean
   needs_decision: boolean
   answers: AnswerRecord[]
+  /** 最近一次教学动作；为空表示没有可「重新生成」的回复（FR-413）。 */
+  last_action: string | null
 }
 
 export interface Settings {
@@ -255,6 +257,7 @@ export type SseEventType =
   | 'assessment'
   | 'path'
   | 'options'
+  | 'hint'
   | 'error'
   | 'done'
 
@@ -310,6 +313,17 @@ export interface OptionsPayload {
   message: string
   directions: string[]
 }
+
+/** 一级提示（FR-407）。`label` 是后端给的中文名，前端直接展示。 */
+export interface HintPayload {
+  level: number
+  label: string
+  question: string
+}
+
+/** 提示级别（1 方向性 / 2 关键要素 / 3 近似答案）。 */
+export const HINT_LEVELS = [1, 2, 3] as const
+export type HintLevel = (typeof HINT_LEVELS)[number]
 
 export interface SseEvent {
   type: SseEventType

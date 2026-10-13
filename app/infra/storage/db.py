@@ -17,12 +17,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """当前表结构版本。
 
 - v1：设置、密钥、会话记忆、用量（P0/P1）。
 - v2：学习领域表（主题、会话状态、测评、路径、知识点、检查点、作答、薄弱点、笔记）。
 - v3：``session_state.awaiting_decision``（"正在等用户三选一"必须跨重启可见）。
+- v4（P3）：
+  - ``message.kind``：消息用途标记，用于把"自由提问"（FR-411）与检查点问答区分开；
+  - ``session_state.last_action``：最近一次教学动作，供"重新生成上一条回复"（FR-413）
+    知道该重跑哪一个动作——不知道上一步做了什么就没法重跑。
 
 升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
 
@@ -35,6 +39,8 @@ SCHEMA_VERSION = 3
 
 _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     ("session_state", "awaiting_decision", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("session_state", "last_action", "VARCHAR(32)"),
+    ("message", "kind", "VARCHAR(24)"),
 )
 
 

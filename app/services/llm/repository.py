@@ -119,6 +119,7 @@ class MemoryRepository:
                             reasoning_content=_read_optional(envelope.data, REASONING_KEY),
                             tool_calls_json=_dump_tool_calls(envelope.data),
                             is_summary=envelope.is_summary,
+                            kind=envelope.kind or None,
                             token_count=envelope.token_count,
                         )
                     )
@@ -156,6 +157,7 @@ class MemoryRepository:
                 MessageEnvelope(
                     _to_protocol_message(row),
                     is_summary=row.is_summary,
+                    kind=row.kind or "",
                     token_count=row.token_count,
                 )
             )

@@ -1,4 +1,4 @@
-"""领域仓储（T2.1）。
+﻿"""领域仓储（T2.1）。
 
 约定：
 
@@ -10,7 +10,7 @@
 
 import json
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 
 from sqlalchemy import delete, func, select
@@ -102,7 +102,7 @@ def _as_str_list(value: object) -> list[str]:
     return items
 
 
-def _as_mapping_list(value: object) -> list[dict[str, object]]:
+def _as_mapping_list(value: object) -> Sequence[Mapping[str, object]]:
     if not isinstance(value, list | tuple):
         return []
     return [item for item in value if isinstance(item, dict)]
@@ -132,6 +132,7 @@ def _to_session(row: SessionStateRow) -> SessionSnapshot:
         node_attempts=row.node_attempts,
         taught_node_id=row.taught_node_id,
         awaiting_decision=bool(row.awaiting_decision),
+        last_action=row.last_action,
         updated_at=row.updated_at,
     )
 
@@ -446,6 +447,7 @@ class SessionStateRepository:
             "node_attempts",
             "taught_node_id",
             "awaiting_decision",
+            "last_action",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -657,31 +659,7 @@ class PathRepository:
             session.flush()
 
             for index, node in enumerate(nodes):
-                node_row = KnowledgePointRow(
-                    id=new_id(),
-                    path_id=path_id,
-                    order_index=index,
-                    title=str(node.get("title", "")),
-                    objective=str(node.get("objective", "")),
-                    prerequisites_json=_dump_list(_as_str_list(node.get("prerequisites"))),
-                    key_points_json=_dump_list(_as_str_list(node.get("key_points"))),
-                    is_quick_review=bool(node.get("is_quick_review", False)),
-                )
-                session.add(node_row)
-                # 同理：checkpoint 引用 node，必须先落盘 node 行
-                session.flush()
-
-                for order, checkpoint in enumerate(_as_mapping_list(node.get("checkpoints"))):
-                    session.add(
-                        CheckpointRow(
-                            id=new_id(),
-                            node_id=node_row.id,
-                            order_index=order,
-                            question=str(checkpoint.get("question", "")),
-                            expected_points_json=_dump_list(_as_str_list(checkpoint.get("expected_points"))),
-                            reference_answer=str(checkpoint.get("reference_answer", "")),
-                        )
-                    )
+                self._insert_node(session, path_id, index, node)
 
         created = self.get(path_id)
         assert created is not None
@@ -860,6 +838,123 @@ class PathRepository:
 
     def first_node(self, path_id: str) -> KnowledgePoint | None:
         return self.next_node(path_id, after_order_index=-1)
+
+    # ------------------------------------------------------------------ #
+    # 编辑（FR-304、FR-305）
+    # ------------------------------------------------------------------ #
+
+    def replace_nodes(self, path_id: str, nodes: Sequence[dict[str, object]]) -> LearningPath | None:
+        """用给定的节点列表**整体替换**路径内容（顺序即 ``order_index``）。
+
+        编辑操作统一走"读出 → 在内存里改 → 整体写回"，而不是对单行做增量 UPDATE：
+        排序、插入、删除都要重排 ``order_index``，增量更新极易留下重复序号，
+        而重复序号会让 ``next_node`` 随机挑到一个节点。
+
+        已有的 ``answer_record`` 不删——它是学习者自己的作答历史，
+        节点被删掉后仍然应该能在档案里查到。
+        """
+        with self._db.session() as session:
+            row = session.get(LearningPathRow, path_id)
+            if row is None:
+                return None
+
+            old_node_ids = list(
+                session.scalars(select(KnowledgePointRow.id).where(KnowledgePointRow.path_id == path_id))
+            )
+            if old_node_ids:
+                # checkpoint 与 node 都是 ondelete CASCADE，但显式删除更直白
+                session.execute(delete(CheckpointRow).where(CheckpointRow.node_id.in_(old_node_ids)))
+                session.execute(delete(KnowledgePointRow).where(KnowledgePointRow.id.in_(old_node_ids)))
+            session.flush()
+
+            for index, node in enumerate(nodes):
+                self._insert_node(session, path_id, index, node)
+
+        return self.get(path_id)
+
+    def update_rationale(self, path_id: str, rationale: str) -> bool:
+        with self._db.session() as session:
+            row = session.get(LearningPathRow, path_id)
+            if row is None:
+                return False
+            row.rationale = rationale
+            session.add(row)
+            return True
+
+    def replace_node(self, node_id: str, payload: dict[str, object]) -> KnowledgePoint | None:
+        """替换单个节点的内容，**保留它的 id 与学习状态**。
+
+        "重生成单个节点"必须保留 id：节点的 ``answer_record``、笔记、薄弱点都挂在 id 上，
+        换 id 等于把这些记录变成孤儿。
+        """
+        with self._db.session() as session:
+            row = session.get(KnowledgePointRow, node_id)
+            if row is None:
+                return None
+
+            row.title = str(payload.get("title", row.title))
+            row.objective = str(payload.get("objective", row.objective))
+            if "prerequisites" in payload:
+                row.prerequisites_json = _dump_list(_as_str_list(payload.get("prerequisites")))
+            if "key_points" in payload:
+                row.key_points_json = _dump_list(_as_str_list(payload.get("key_points")))
+            if "is_quick_review" in payload:
+                row.is_quick_review = bool(payload.get("is_quick_review"))
+            session.add(row)
+
+            if "checkpoints" in payload:
+                session.execute(delete(CheckpointRow).where(CheckpointRow.node_id == node_id))
+                session.flush()
+                self._insert_checkpoints(session, node_id, _as_mapping_list(payload.get("checkpoints")))
+
+            session.flush()
+            return self._node_with_checkpoints(session, node_id)
+
+    @staticmethod
+    def _insert_node(session: object, path_id: str, index: int, node: Mapping[str, object]) -> str:
+        """插入一个节点及其检查点，返回节点 id。
+
+        **优先复用 ``node["id"]``**：编辑路径时整表重写，若给所有节点换新 id，
+        挂在旧 id 上的作答记录、笔记、薄弱点就全成了孤儿。只有新增节点才生成新 id。
+        """
+        raw_state = node.get("state")
+        # 编辑已有路径时要把节点的学习状态带过去（重排顺序不该把"已掌握"重置成"未开始"）
+        state = raw_state.value if isinstance(raw_state, NodeState) else str(raw_state or NodeState.NOT_STARTED.value)
+        raw_id = node.get("id")
+        node_id = str(raw_id) if isinstance(raw_id, str) and raw_id else new_id()
+
+        node_row = KnowledgePointRow(
+            id=node_id,
+            path_id=path_id,
+            order_index=index,
+            title=str(node.get("title", "")),
+            objective=str(node.get("objective", "")),
+            prerequisites_json=_dump_list(_as_str_list(node.get("prerequisites"))),
+            key_points_json=_dump_list(_as_str_list(node.get("key_points"))),
+            is_quick_review=bool(node.get("is_quick_review", False)),
+            state=state,
+        )
+        session.add(node_row)  # type: ignore[attr-defined]
+        # checkpoint 引用 node，必须先落盘 node 行
+        session.flush()  # type: ignore[attr-defined]
+        PathRepository._insert_checkpoints(session, node_row.id, _as_mapping_list(node.get("checkpoints")))
+        return node_row.id
+
+    @staticmethod
+    def _insert_checkpoints(session: object, node_id: str, checkpoints: Sequence[Mapping[str, object]]) -> None:
+        for order, checkpoint in enumerate(checkpoints):
+            raw_id = checkpoint.get("id")
+            checkpoint_id = str(raw_id) if isinstance(raw_id, str) and raw_id else new_id()
+            session.add(  # type: ignore[attr-defined]
+                CheckpointRow(
+                    id=checkpoint_id,
+                    node_id=node_id,
+                    order_index=order,
+                    question=str(checkpoint.get("question", "")),
+                    expected_points_json=_dump_list(_as_str_list(checkpoint.get("expected_points"))),
+                    reference_answer=str(checkpoint.get("reference_answer", "")),
+                )
+            )
 
 
 class AnswerRepository:

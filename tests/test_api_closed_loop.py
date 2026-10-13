@@ -1,4 +1,4 @@
-"""后端闭环集成测试（p2-backend-tests）。
+﻿"""后端闭环集成测试（p2-backend-tests）。
 
 这是 P2A 的出口条件：**用桩 LLM 驱动 HTTP 接口跑完一个主题的完整闭环**——
 
@@ -63,6 +63,25 @@ def profile_json(level: str = "none") -> str:
 
 def path_json(count: int = 3) -> str:
     return json.dumps({"rationale": "依据画像从基础推进。", "nodes": path_nodes(count)}, ensure_ascii=False)
+
+
+def node_json(title: str, *, checkpoints: int = 1) -> dict:
+    """单节点重生成时模型应返回的结构（与 planner_node 提示词的样例一致）。"""
+    return {
+        "title": title,
+        "objective": f"能解释 {title}",
+        "prerequisites": [],
+        "key_points": ["要点一", "要点二", "要点三"],
+        "checkpoints": [
+            {
+                "question": f"{title} 的检查点 {index}？",
+                "expected_points": ["判定要点"],
+                "reference_answer": "参考答案",
+            }
+            for index in range(checkpoints)
+        ],
+        "is_quick_review": False,
+    }
 
 
 def verdict_json(verdict: str) -> str:
@@ -454,6 +473,146 @@ def test_path_confirm_gate(api: ApiHarness) -> None:
     run_path(api, subject_id, nodes=3)
     confirmed = api.client.post(f"/api/subjects/{subject_id}/path/confirm").json()
     assert confirmed["state"] == "teaching"
+
+
+# --------------------------------------------------------------------------- #
+# 路径编辑接口（FR-304、FR-305）
+# --------------------------------------------------------------------------- #
+
+
+def fetch_nodes(api: ApiHarness, subject_id: str) -> list[dict]:
+    body = api.client.get(f"/api/subjects/{subject_id}/path").json()
+    return body["path"]["nodes"]
+
+
+def test_path_edit_round_trip(api: ApiHarness) -> None:
+    """改内容 → 插节点 → 移动 → 删除，每一步都返回最新路径且序号连续。"""
+    subject_id = prepare_teaching(api)
+    nodes = fetch_nodes(api, subject_id)
+    assert [node["index"] for node in nodes] == [1, 2, 3]
+
+    updated = api.client.patch(
+        f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}",
+        json={"title": "改写后的节点", "key_points": ["新要点 A", "新要点 B"]},
+    ).json()["path"]
+    assert updated["nodes"][0]["title"] == "改写后的节点"
+    assert updated["nodes"][0]["key_points"] == ["新要点 A", "新要点 B"]
+
+    added = api.client.post(
+        f"/api/subjects/{subject_id}/path/nodes", json={"after_node_id": nodes[0]["id"]}
+    ).json()["path"]
+    assert len(added["nodes"]) == 4
+    assert added["nodes"][1]["title"] == "新的知识点"
+    assert [node["index"] for node in added["nodes"]] == [1, 2, 3, 4]
+
+    moved = api.client.post(
+        f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}/move", json={"offset": 1}
+    ).json()["path"]
+    assert [node["title"] for node in moved["nodes"]][:2] == ["新的知识点", "改写后的节点"]
+
+    removed = api.client.delete(f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}").json()["path"]
+    assert len(removed["nodes"]) == 3
+    assert [node["index"] for node in removed["nodes"]] == [1, 2, 3]
+
+    # 编辑落盘：重新读取仍是编辑后的内容
+    assert len(fetch_nodes(api, subject_id)) == 3
+
+
+def test_path_edit_rejects_started_node(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    current = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()
+    node_id = current["node"]["id"]
+
+    deleted = api.client.delete(f"/api/subjects/{subject_id}/path/nodes/{node_id}")
+    moved = api.client.post(f"/api/subjects/{subject_id}/path/nodes/{node_id}/move", json={"offset": 1})
+
+    assert deleted.status_code == 409
+    assert moved.status_code == 409
+    assert "已经进入学习" in deleted.json()["detail"]
+    # 但改内容允许（纠错不该被学习进度挡住）
+    patched = api.client.patch(f"/api/subjects/{subject_id}/path/nodes/{node_id}", json={"title": "纠错"})
+    assert patched.status_code == 200
+
+
+def test_path_edit_unknown_node_returns_conflict(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+
+    response = api.client.patch(f"/api/subjects/{subject_id}/path/nodes/nope", json={"title": "x"})
+
+    assert response.status_code == 409
+    assert "节点不存在" in response.json()["detail"]
+
+
+def test_path_regenerate_node_emits_path_event(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+    nodes = fetch_nodes(api, subject_id)
+    script(api, blocking=[json.dumps(node_json("重生成后的节点"), ensure_ascii=False)])
+
+    events = parse_sse(
+        api.client.post(f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}/regenerate", json={}).text
+    )
+
+    payload = events_of(events, "path")[0].data
+    updated = payload["nodes"][0]
+    assert updated["id"] == nodes[0]["id"]  # id 不变，作答记录仍挂得上
+    assert updated["title"] == "重生成后的节点"
+    assert len(payload["nodes"]) == 3
+
+
+def test_path_regenerate_node_accepts_missing_body(api: ApiHarness) -> None:
+    """请求体可省略：前端不带 requirement 时不该 422。"""
+    subject_id = prepare_teaching(api)
+    nodes = fetch_nodes(api, subject_id)
+    script(api, blocking=[json.dumps(node_json("重生成后的节点"), ensure_ascii=False)])
+
+    response = api.client.post(f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}/regenerate")
+
+    assert response.status_code == 200
+    payload = events_of(parse_sse(response.text), "path")[0].data
+    assert payload["nodes"][0]["title"] == "重生成后的节点"
+
+
+def test_path_regenerate_node_carries_requirement(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+    nodes = fetch_nodes(api, subject_id)
+    script(api, blocking=[json.dumps(node_json("更基础的讲法"), ensure_ascii=False)])
+
+    api.client.post(
+        f"/api/subjects/{subject_id}/path/nodes/{nodes[0]['id']}/regenerate",
+        json={"requirement": "讲得更基础一些"},
+    )
+
+    assert "讲得更基础一些" in api.stub.calls[-1].messages[0]["content"]
+
+
+def test_path_regenerate_whole_path_creates_new_version(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+    script(api, blocking=[path_json(4)])
+
+    events = parse_sse(api.client.post(f"/api/subjects/{subject_id}/path/regenerate").text)
+
+    payload = events_of(events, "path")[0].data
+    assert payload["version"] == 2
+    assert len(payload["nodes"]) == 4
+
+    body = api.client.get(f"/api/subjects/{subject_id}/path").json()
+    assert body["path"]["version"] == 2
+    assert len(body["versions"]) == 2
+    # 重新生成后回到待确认：新版本要重新确认才能继续教学（FR-306）
+    assert api.client.get(f"/api/subjects/{subject_id}/state").json()["session"]["state"] == "path_review"
+
+
+def test_path_regenerate_failure_keeps_current_path(api: ApiHarness) -> None:
+    subject_id = prepare_teaching(api)
+    script(api, blocking=["坏数据", "坏数据"])
+
+    events = parse_sse(api.client.post(f"/api/subjects/{subject_id}/path/regenerate").text)
+
+    assert events_of(events, "path") == []
+    assert events_of(events, "error")[0].data["retryable"] is True
+    assert api.client.get(f"/api/subjects/{subject_id}/path").json()["path"]["version"] == 1
 
 
 # --------------------------------------------------------------------------- #

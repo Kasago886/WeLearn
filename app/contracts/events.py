@@ -45,6 +45,9 @@ class SseEventType(StrEnum):
     OPTIONS = "options"
     """需要用户做出选择（重试耗尽后的三选一，v1.1 新增）。"""
 
+    HINT = "hint"
+    """给出了一级提示（v1.2 新增）。前端据此展示"这是第几级提示"。"""
+
     ERROR = "error"
     """可操作的错误（已分类，不含敏感信息）。"""
 
@@ -170,6 +173,16 @@ class OptionsPayload(BaseModel):
     choices: list[str] = Field(default_factory=list)
     message: str = ""
     directions: list[str] = Field(default_factory=list)
+
+
+class HintPayload(BaseModel):
+    """一级提示（FR-407）。"""
+
+    level: int = 0
+    label: str = ""
+    """级别名称：``方向性提示`` / ``关键要素提示`` / ``近似答案``。"""
+    question: str = ""
+    """提示后重新提出的问题（与提示前是同一道题）。"""
 
 
 class SseFrame(BaseModel):

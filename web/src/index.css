@@ -717,3 +717,19 @@ textarea {
   margin: 0;
   word-break: break-all;
 }
+
+.inline-details {
+  display: inline-block;
+}
+
+.inline-details > summary {
+  cursor: pointer;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  list-style: none;
+}
+
+.inline-details > summary::-webkit-details-marker {
+  display: none;
+}

@@ -8,6 +8,7 @@ import { api } from './client'
 import type {
   AssessmentView,
   Health,
+  LearningPath,
   ModelInfo,
   PathView,
   Progress,
@@ -47,6 +48,25 @@ export const subjectsApi = {
   teaching: (id: string) => api.get<TeachingView>(`/api/subjects/${id}/teach/current`),
   pause: (id: string) => api.post<{ state: string }>(`/api/subjects/${id}/teach/pause`),
   resume: (id: string) => api.post<{ state: string }>(`/api/subjects/${id}/teach/resume`),
+
+  // 路径编辑（FR-304、FR-305）
+  updateNode: (id: string, nodeId: string, payload: Partial<NodeEditableFields>) =>
+    api.patch<{ path: LearningPath }>(`/api/subjects/${id}/path/nodes/${nodeId}`, payload),
+  addNode: (id: string, afterNodeId?: string | null) =>
+    api.post<{ path: LearningPath }>(`/api/subjects/${id}/path/nodes`, {
+      after_node_id: afterNodeId ?? null,
+    }),
+  deleteNode: (id: string, nodeId: string) =>
+    api.del<{ path: LearningPath }>(`/api/subjects/${id}/path/nodes/${nodeId}`),
+  moveNode: (id: string, nodeId: string, offset: -1 | 1) =>
+    api.post<{ path: LearningPath }>(`/api/subjects/${id}/path/nodes/${nodeId}/move`, { offset }),
+}
+
+export interface NodeEditableFields {
+  title: string
+  objective: string
+  key_points: string[]
+  prerequisites: string[]
 }
 
 /** 流式端点（POST + SSE）：只提供路径，实际请求由 useTurnStream 发起。 */
@@ -58,6 +78,12 @@ export const streamPaths = {
   teachAnswer: (id: string) => `/api/subjects/${id}/teach/answer`,
   teachDecision: (id: string) => `/api/subjects/${id}/teach/decision`,
   teachSkip: (id: string) => `/api/subjects/${id}/teach/skip`,
+  teachHint: (id: string) => `/api/subjects/${id}/teach/hint`,
+  teachAsk: (id: string) => `/api/subjects/${id}/teach/ask`,
+  teachRegenerate: (id: string) => `/api/subjects/${id}/teach/regenerate`,
+  pathRegenerateNode: (id: string, nodeId: string) =>
+    `/api/subjects/${id}/path/nodes/${nodeId}/regenerate`,
+  pathRegenerate: (id: string) => `/api/subjects/${id}/path/regenerate`,
 }
 
 export const assessmentApi = {

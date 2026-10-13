@@ -9,6 +9,7 @@
 """
 
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -32,6 +33,7 @@ from app.contracts.events import (
     AssessmentPayload,
     AssessmentProfilePayload,
     CheckpointPayload,
+    HintPayload,
     NodeStatePayload,
     OptionsKind,
     OptionsPayload,
@@ -46,6 +48,7 @@ from app.services.learning.entities import KnowledgePoint
 from app.services.learning.planning import PlanningError
 from app.services.learning.stack import LearningStack
 from app.services.learning.state import TransitionError
+from app.services.learning.teaching import HINT_LEVEL_LABELS
 
 router = APIRouter(prefix="/api/subjects", tags=["subjects"])
 
@@ -90,6 +93,45 @@ class DecisionRequest(BaseModel):
 class OverrideLevelRequest(BaseModel):
     topic: str
     level: MasteryLevel
+
+
+class UpdateNodeRequest(BaseModel):
+    """改节点内容（FR-304）。全部字段可选，只改传了的那些。"""
+
+    title: str | None = None
+    objective: str | None = None
+    key_points: list[str] | None = None
+    prerequisites: list[str] | None = None
+
+
+class AddNodeRequest(BaseModel):
+    """在某个节点之后插入空白节点；不传则追加到末尾。"""
+
+    after_node_id: str | None = None
+
+
+class MoveNodeRequest(BaseModel):
+    """-1 上移 / 1 下移。"""
+
+    offset: int = Field(ge=-1, le=1)
+
+
+class RegenerateRequest(BaseModel):
+    """期望的调整方向（可留空）。整块请求体可以省略。"""
+
+    requirement: str = Field(default="", max_length=500)
+
+
+class HintRequest(BaseModel):
+    """提示级别（FR-407）：不传则按连续失败次数自动选级。"""
+
+    level: int | None = Field(default=None, ge=1, le=3)
+
+
+class AskRequest(BaseModel):
+    """穿插提问（FR-411）。"""
+
+    question: str = Field(min_length=1, max_length=2000)
 
 
 # --------------------------------------------------------------------------- #
@@ -413,6 +455,103 @@ def path_confirm(subject_id: str, stack: LearningStack = Depends(get_stack)) -> 
 
 
 # --------------------------------------------------------------------------- #
+# 路径编辑（FR-304、FR-305）
+# --------------------------------------------------------------------------- #
+
+
+def _edit_call(action: Callable[[], Any]) -> dict[str, Any]:
+    """把编辑操作统一成 "返回最新路径 + 把领域错误转成 409"。
+
+    编辑冲突（删掉已开始的节点、移动到头了）都是"请求合法但当前状态不允许"，
+    用 409 而不是 400/422，前端可以据此提示而不是当成参数错误。
+    """
+    try:
+        path = action()
+    except PlanningError as exc:
+        raise _conflict(exc) from exc
+    return {"path": path_payload(path)}
+
+
+@router.patch("/{subject_id}/path/nodes/{node_id}")
+def path_update_node(
+    subject_id: str,
+    node_id: str,
+    payload: UpdateNodeRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """改节点的标题 / 目标 / 要点（FR-304）。"""
+    require_subject(stack, subject_id)
+    return _edit_call(
+        lambda: stack.planning.update_node(
+            subject_id,
+            node_id,
+            title=payload.title,
+            objective=payload.objective,
+            key_points=payload.key_points,
+            prerequisites=payload.prerequisites,
+        )
+    )
+
+
+@router.post("/{subject_id}/path/nodes")
+def path_add_node(
+    subject_id: str,
+    payload: AddNodeRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """插入一个空白节点（FR-304）。"""
+    require_subject(stack, subject_id)
+    return _edit_call(lambda: stack.planning.add_node(subject_id, after_node_id=payload.after_node_id))
+
+
+@router.delete("/{subject_id}/path/nodes/{node_id}")
+def path_delete_node(
+    subject_id: str,
+    node_id: str,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """删除节点（FR-304）；只允许删除尚未开始的节点。"""
+    require_subject(stack, subject_id)
+    return _edit_call(lambda: stack.planning.delete_node(subject_id, node_id))
+
+
+@router.post("/{subject_id}/path/nodes/{node_id}/move")
+def path_move_node(
+    subject_id: str,
+    node_id: str,
+    payload: MoveNodeRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """上移 / 下移节点（FR-304）。"""
+    require_subject(stack, subject_id)
+    return _edit_call(lambda: stack.planning.move_node(subject_id, node_id, offset=payload.offset))
+
+
+@router.post("/{subject_id}/path/nodes/{node_id}/regenerate")
+def path_regenerate_node(
+    subject_id: str,
+    node_id: str,
+    payload: RegenerateRequest | None = None,
+    stack: LearningStack = Depends(get_stack),
+) -> Any:
+    """重生成单个节点（FR-304），保留节点 id 与它的作答记录。"""
+    require_subject(stack, subject_id)
+    requirement = payload.requirement if payload is not None else ""
+    stream = TurnStream(
+        lambda on_delta: stack.planning.regenerate_node(subject_id, node_id, requirement=requirement)
+    )
+    return sse_response(stream, postprocess=_path_frames)
+
+
+@router.post("/{subject_id}/path/regenerate")
+def path_regenerate(subject_id: str, stack: LearningStack = Depends(get_stack)) -> Any:
+    """整条重新生成（FR-305）：旧版本保留，确认后新版本才成为当前版本。"""
+    require_subject(stack, subject_id)
+    stream = TurnStream(lambda on_delta: stack.planning.regenerate(subject_id))
+    return sse_response(stream, postprocess=_path_frames)
+
+
+# --------------------------------------------------------------------------- #
 # 教学
 # --------------------------------------------------------------------------- #
 
@@ -427,6 +566,23 @@ def _options_frames(turn: Any) -> list[str]:
         directions=["simpler", "example", "hint"],
     )
     return [encode_frame(SseEventType.OPTIONS, payload)]
+
+
+def _hint_frames(turn: Any) -> list[str]:
+    """提示事件：告诉前端"这是第几级"，避免它自己从文本里猜。"""
+    level = int(getattr(turn, "hint_level", 0) or 0)
+    if level <= 0:
+        return []
+    return [
+        encode_frame(
+            SseEventType.HINT,
+            HintPayload(
+                level=level,
+                label=HINT_LEVEL_LABELS.get(level, ""),
+                question=str(getattr(turn, "pending_question", "") or ""),
+            ),
+        )
+    ]
 
 
 def _teaching_frames(stack: LearningStack) -> Any:
@@ -467,6 +623,7 @@ def _teaching_frames(stack: LearningStack) -> Any:
                 )
 
         frames.extend(_options_frames(turn))
+        frames.extend(_hint_frames(turn))
         return frames
 
     return postprocess
@@ -515,6 +672,42 @@ def teach_skip(subject_id: str, stack: LearningStack = Depends(get_stack)) -> An
     """跳过当前节点（FR-409）。"""
     require_subject(stack, subject_id)
     stream = TurnStream(lambda on_delta: _skip(stack, subject_id))
+    return sse_response(stream, postprocess=_teaching_frames(stack))
+
+
+@router.post("/{subject_id}/teach/hint")
+def teach_hint(
+    subject_id: str,
+    payload: HintRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> Any:
+    """索取提示（FR-407）：不传级别时按连续失败次数自动加深。"""
+    require_subject(stack, subject_id)
+    stream = TurnStream(
+        lambda on_delta: stack.teaching.hint(subject_id, level=payload.level, on_delta=on_delta)
+    )
+    return sse_response(stream, postprocess=_teaching_frames(stack))
+
+
+@router.post("/{subject_id}/teach/ask")
+def teach_ask(
+    subject_id: str,
+    payload: AskRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> Any:
+    """穿插提问（FR-411）：回答后回到主线，不改变节点状态。"""
+    require_subject(stack, subject_id)
+    stream = TurnStream(
+        lambda on_delta: stack.teaching.ask(subject_id, payload.question, on_delta=on_delta)
+    )
+    return sse_response(stream, postprocess=_teaching_frames(stack))
+
+
+@router.post("/{subject_id}/teach/regenerate")
+def teach_regenerate(subject_id: str, stack: LearningStack = Depends(get_stack)) -> Any:
+    """重新生成上一条回复（FR-413）：按记录下来的动作重跑一次。"""
+    require_subject(stack, subject_id)
+    stream = TurnStream(lambda on_delta: stack.teaching.regenerate_last(subject_id, on_delta=on_delta))
     return sse_response(stream, postprocess=_teaching_frames(stack))
 
 
@@ -577,6 +770,8 @@ def teach_current(subject_id: str, stack: LearningStack = Depends(get_stack)) ->
         "can_answer": view.can_answer,
         "needs_decision": view.needs_decision,
         "answers": answers,
+        # 最近一次教学动作；为空表示没有可"重新生成"的回复（FR-413）
+        "last_action": view.snapshot.last_action,
     }
 
 

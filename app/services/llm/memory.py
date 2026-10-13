@@ -1,4 +1,4 @@
-"""对话记忆模型（T1.1，FR-601、FR-603）。
+﻿"""对话记忆模型（T1.1，FR-601、FR-603）。
 
 三层记忆中的前两层在这里落地：
 
@@ -129,17 +129,20 @@ def ensure_leading_system(memory: "Memory", content: str) -> None:
 class MessageEnvelope:
     """协议载荷 + 我们自己的元信息。"""
 
-    __slots__ = ("data", "is_summary", "token_count")
+    __slots__ = ("data", "is_summary", "kind", "token_count")
 
     def __init__(
         self,
         data: ProtocolMessage,
         *,
         is_summary: bool = False,
+        kind: str = "",
         token_count: int | None = None,
     ) -> None:
         self.data = data
         self.is_summary = is_summary
+        self.kind = kind
+        """用途标记（如 :data:`KIND_OFF_TOPIC`）。**元信息**，不会进入协议字典。"""
         self.token_count = token_count
 
     @property
@@ -154,6 +157,7 @@ class MessageEnvelope:
         return MessageEnvelope(
             data=_deep_copy_message(self.data),
             is_summary=self.is_summary,
+            kind=self.kind,
             token_count=self.token_count,
         )
 
@@ -185,8 +189,8 @@ class ChatRound:
     def is_system_round(self) -> bool:
         return bool(self.messages) and has_role(self.messages[0].data, ROLE_SYSTEM)
 
-    def add(self, message: ProtocolMessage, *, is_summary: bool = False) -> MessageEnvelope:
-        envelope = MessageEnvelope(message, is_summary=is_summary)
+    def add(self, message: ProtocolMessage, *, is_summary: bool = False, kind: str = "") -> MessageEnvelope:
+        envelope = MessageEnvelope(message, is_summary=is_summary, kind=kind)
         self.messages.append(envelope)
         return envelope
 
@@ -236,11 +240,13 @@ class Memory:
             self._rounds.append(round_)
         return round_
 
-    def add_message_to_last_round(self, message: ProtocolMessage, *, is_summary: bool = False) -> None:
+    def add_message_to_last_round(
+        self, message: ProtocolMessage, *, is_summary: bool = False, kind: str = ""
+    ) -> None:
         with self.lock:
             if not self._rounds:
                 self._rounds.append(ChatRound())
-            self._rounds[-1].add(message, is_summary=is_summary)
+            self._rounds[-1].add(message, is_summary=is_summary, kind=kind)
 
     def outbound_messages(self) -> list[ProtocolMessage]:
         """展开为发给模型的消息数组（返回深拷贝，调用方改写不会污染记忆）。"""
@@ -310,6 +316,15 @@ class Memory:
     def from_protocol(cls, rounds: list[list[ProtocolMessage]]) -> "Memory":
         """从协议消息构造（用于测试与反序列化）。"""
         return cls([ChatRound([MessageEnvelope(message) for message in messages]) for messages in rounds])
+
+
+KIND_OFF_TOPIC = "off_topic"
+"""穿插提问（FR-411）的用途标记。
+
+它的作用很具体：**把"学习者随口问的问题"与"检查点作答"分开**。
+前者不进 ``answer_record``、不参与判定、不改节点状态；有了这个标记，
+档案与调试日志里也能一眼看出哪些内容不属于教学主线。
+"""
 
 
 def visible_messages(memory: Memory, *, limit: int | None = None) -> list[dict[str, str]]:

@@ -171,6 +171,7 @@ class SessionStateService:
         """进入某节点：切换当前节点、清零尝试次数、清空待回答与待决策标记。
 
         同时把 ``taught_node_id`` 清空——新节点尚未讲解，教学服务据此决定是否要生成讲解。
+        ``last_action`` 也一并清空：上一条回复属于上一个节点，"重新生成"它没有意义（FR-413）。
         """
         return self._sessions.update(
             subject_id,
@@ -180,6 +181,7 @@ class SessionStateService:
             pending_checkpoint_id=None,
             pending_question=None,
             awaiting_decision=False,
+            last_action=None,
         )
 
     def mark_taught(self, subject_id: str) -> SessionSnapshot:
@@ -201,6 +203,14 @@ class SessionStateService:
             pending_question=question,
             awaiting_decision=False,
         )
+
+    def set_last_action(self, subject_id: str, action: str) -> SessionSnapshot:
+        """记录最近一次教学动作，供"重新生成上一条回复"重跑（FR-413）。"""
+        return self._sessions.update(subject_id, last_action=action)
+
+    def clear_last_action(self, subject_id: str) -> SessionSnapshot:
+        """节点切换或作答后清空——上一条回复已经不属于当前进度了。"""
+        return self._sessions.update(subject_id, last_action=None)
 
     def clear_pending(self, subject_id: str) -> SessionSnapshot:
         return self._sessions.clear_pending(subject_id)

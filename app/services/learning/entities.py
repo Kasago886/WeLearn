@@ -16,6 +16,21 @@ from app.contracts.schemas import (
     WeakPointReason,
 )
 
+TERMINAL_NODE_STATES = frozenset({NodeState.MASTERED, NodeState.PARTIAL, NodeState.SKIPPED})
+"""节点已"走完"的状态：教学推进时跳过它们。"""
+
+FRESH_NODE_STATES = frozenset({NodeState.NOT_STARTED, NodeState.REVIEW_NEEDED})
+"""尚未开始学习的节点：进入节点时从这些状态改成 ``learning``（FR-309）。"""
+
+MOVABLE_NODE_STATES = FRESH_NODE_STATES
+"""允许被删除、调整顺序、单节点重生成的状态。
+
+``learning``（正在学）与三个终态都不能动：把"已掌握"挪到别的位置，等于让掌握状态
+落在另一个知识点上；删除正在学的节点会让会话指向一个不存在的节点。
+放在本模块是因为路径编辑（``planning``）与教学（``teaching``）都要用它，
+而 ``teaching`` 依赖 ``planning``——从 teaching 导入会形成循环。
+"""
+
 
 @dataclass(frozen=True)
 class Subject:
@@ -73,6 +88,11 @@ class SessionSnapshot:
     node_attempts: int = 0
     taught_node_id: str | None = None
     awaiting_decision: bool = False
+    last_action: str | None = None
+    """最近一次教学动作（``explain`` / ``reteach:simpler`` / ``hint:2`` …）。
+
+    "重新生成上一条回复"（FR-413）必须知道上一步做了什么，否则无从重跑。
+    """
     updated_at: datetime | None = None
 
     @property
@@ -173,7 +193,6 @@ class LearningPath:
     is_active: bool
     created_at: datetime
     nodes: tuple[KnowledgePoint, ...] = field(default_factory=tuple)
-
     @property
     def node_count(self) -> int:
         return len(self.nodes)

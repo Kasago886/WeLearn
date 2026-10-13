@@ -2,7 +2,7 @@
 
 import { errorMessage } from '../api/client'
 import { subjectsApi, streamPaths } from '../api/endpoints'
-import type { AnswerRecord, NodeDecision, OptionsPayload, SseEvent, VerdictPayload } from '../api/types'
+import type { AnswerRecord, HintPayload, NodeDecision, OptionsPayload, SseEvent, VerdictPayload } from '../api/types'
 import { Banner, Spinner, VerdictCard } from '../components/Banner'
 import { AssistantText, Conversation, StreamingBubble, UserBubble } from '../components/Conversation'
 import { Markdown } from '../components/Markdown'
@@ -109,9 +109,12 @@ export function TeachingPage() {
   const stream = useTurnStream()
   const [verdict, setVerdict] = useState<VerdictPayload | null>(null)
   const [options, setOptions] = useState<OptionsPayload | null>(null)
+  const [hint, setHint] = useState<HintPayload | null>(null)
   const [domainError, setDomainError] = useState<string | null>(null)
   const [pendingAnswer, setPendingAnswer] = useState<string | null>(null)
   const [answer, setAnswer] = useState('')
+  const [question, setQuestion] = useState('')
+  const [asking, setAsking] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const { data, error, reload } = useResource(() => subjectsApi.teaching(subjectId), [subjectId])
@@ -123,6 +126,7 @@ export function TeachingPage() {
   const paused = session.state === 'paused'
   const completed = session.state === 'completed'
   const needsDecision = data?.needs_decision ?? state.needs_decision
+  const lastAction = data?.last_action ?? null
 
   // 本地乐观气泡与服务端记录在渲染时对齐：服务端一旦有了这条作答就不再显示本地副本
   const showPendingAnswer =
@@ -146,6 +150,10 @@ export function TeachingPage() {
       setOptions(event.data as unknown as OptionsPayload)
       return
     }
+    if (event.type === 'hint') {
+      setHint(event.data as unknown as HintPayload)
+      return
+    }
     if (event.type === 'node_state') {
       setOptions(null)
     }
@@ -155,6 +163,7 @@ export function TeachingPage() {
     setDomainError(null)
     setVerdict(null)
     setOptions(null)
+    setHint(null)
     void stream.run(streamPaths.teachStart(subjectId), undefined, handleEvent).then(afterTurn)
   }
 
@@ -163,9 +172,41 @@ export function TeachingPage() {
     setDomainError(null)
     setVerdict(null)
     setOptions(null)
+    setHint(null)
     setPendingAnswer(text)
     setAnswer('')
     void stream.run(streamPaths.teachAnswer(subjectId), { answer: text }, handleEvent).then(afterTurn)
+  }
+
+  /** 要提示：不传级别，让后端按连续失败次数自动选级（FR-407）。 */
+  function requestHint(level?: number): void {
+    if (stream.streaming) return
+    setDomainError(null)
+    setHint(null)
+    void stream
+      .run(streamPaths.teachHint(subjectId), level ? { level } : {}, handleEvent)
+      .then(afterTurn)
+  }
+
+  /** 穿插提问：回答后回到主线，不改变节点状态（FR-411）。 */
+  function ask(): void {
+    const text = question.trim()
+    if (!text || stream.streaming) return
+    setAsking(false)
+    setQuestion('')
+    setDomainError(null)
+    setHint(null)
+    void stream.run(streamPaths.teachAsk(subjectId), { question: text }, handleEvent).then(afterTurn)
+  }
+
+  /** 重新生成上一条回复（FR-413）。 */
+  function regenerate(): void {
+    if (stream.streaming || !lastAction) return
+    setDomainError(null)
+    setVerdict(null)
+    setOptions(null)
+    setHint(null)
+    void stream.run(streamPaths.teachRegenerate(subjectId), undefined, handleEvent).then(afterTurn)
   }
 
   function decide(decision: NodeDecision, direction?: string): void {
@@ -379,6 +420,86 @@ export function TeachingPage() {
               ) : null}
             </div>
           </form>
+
+          {/* 教学动作条（FR-407 / FR-411 / FR-413） */}
+          <div className="btn-row" style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={generating || paused || completed || !pendingQuestion}
+              title="按你连续失败的次数自动决定提示深浅"
+              onClick={() => requestHint()}
+            >
+              给点提示
+            </button>
+            <details className="inline-details">
+              <summary className="small muted">指定提示级别</summary>
+              <div className="btn-row" style={{ marginTop: 6 }}>
+                <button type="button" className="btn btn-sm" disabled={generating} onClick={() => requestHint(1)}>
+                  1 方向性
+                </button>
+                <button type="button" className="btn btn-sm" disabled={generating} onClick={() => requestHint(2)}>
+                  2 关键要素
+                </button>
+                <button type="button" className="btn btn-sm" disabled={generating} onClick={() => requestHint(3)}>
+                  3 近似答案
+                </button>
+              </div>
+            </details>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={generating || paused || completed}
+              onClick={() => setAsking((value) => !value)}
+            >
+              {asking ? '收起提问' : '穿插提问'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={generating || lastAction === null}
+              title={lastAction === null ? '当前没有可重新生成的回复' : `上一步：${lastAction}`}
+              onClick={regenerate}
+            >
+              重新生成上一条
+            </button>
+          </div>
+
+          {asking ? (
+            <form
+              className="composer"
+              onSubmit={(event) => {
+                event.preventDefault()
+                ask()
+              }}
+            >
+              <textarea
+                aria-label="提问"
+                value={question}
+                placeholder="想问什么都可以，比如「这个和我学过的 XX 有什么区别」。答完会回到当前问题。"
+                onChange={(event) => setQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    event.currentTarget.form?.requestSubmit()
+                  }
+                }}
+              />
+              <div className="composer-actions">
+                <button type="submit" className="btn btn-primary" disabled={!question.trim() || generating}>
+                  提问
+                </button>
+                <span className="muted small">不会计入作答</span>
+              </div>
+            </form>
+          ) : null}
+
+          {hint ? (
+            <p className="node-state-notice">
+              本轮给出的是 <strong>第 {hint.level} 级：{hint.label}</strong>
+              {hint.question ? ` · 问题没有变：${hint.question}` : ''}
+            </p>
+          ) : null}
         </div>
 
         {needsDecision && options === null && !generating ? (

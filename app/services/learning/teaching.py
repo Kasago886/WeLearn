@@ -55,9 +55,19 @@ from app.contracts.schemas import (
 from app.infra.deepseek.protocol import StreamEvent
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.infra.settings import AppSettings
-from app.prompts import TUTOR, TUTOR_FEEDBACK, TUTOR_REFERENCE, TUTOR_SUMMARY, render
+from app.prompts import (
+    TUTOR,
+    TUTOR_FEEDBACK,
+    TUTOR_HINT,
+    TUTOR_OFF_TOPIC,
+    TUTOR_REFERENCE,
+    TUTOR_SUMMARY,
+    render,
+)
 from app.services.learning.assessment import AssessmentService
 from app.services.learning.entities import (
+    FRESH_NODE_STATES,
+    TERMINAL_NODE_STATES,
     Checkpoint,
     KnowledgePoint,
     LearningPath,
@@ -70,7 +80,7 @@ from app.services.learning.session import ConversationSession, ConversationSessi
 from app.services.learning.state import AnswerNotAllowedError, SessionStateService
 from app.services.llm.agent import DeltaCallback
 from app.services.llm.judge import JudgeInput
-from app.services.llm.memory import ensure_leading_system, user_message
+from app.services.llm.memory import KIND_OFF_TOPIC, ensure_leading_system, user_message
 from app.services.llm.result import RoundResult
 from app.services.llm.structured import StructuredOutputError
 
@@ -82,11 +92,6 @@ class _Counter(TypedDict):
     node_total: int
 
 
-TERMINAL_NODE_STATES = frozenset({NodeState.MASTERED, NodeState.PARTIAL, NodeState.SKIPPED})
-
-FRESH_NODE_STATES = frozenset({NodeState.NOT_STARTED, NodeState.REVIEW_NEEDED})
-"""尚未开始的节点状态：进入节点时要从这些状态改成 ``learning``（FR-309）。"""
-
 QUESTION_TRANSITION = "\n\n---\n\n**来检验一下你的理解：**\n\n"
 REFERENCE_PREFIX = "**这是参考答案：**\n\n"
 SIMPLIFIED_PREFIX = "\n\n**换个更基础的角度再说一遍：**\n\n"
@@ -96,6 +101,63 @@ DIRECTION_HINTS: dict[str, str] = {
     "example": "学习者希望换个例子：请换一个更具体、可验算的例子。",
     "hint": "学习者希望得到提示：只给方向性提示，不要给出完整答案。",
 }
+
+# --------------------------------------------------------------------------- #
+# 分级提示（FR-407）
+# --------------------------------------------------------------------------- #
+
+HINT_LEVEL_MIN = 1
+HINT_LEVEL_MAX = 3
+HINT_LEVEL_LABELS: dict[int, str] = {
+    1: "方向性提示",
+    2: "关键要素提示",
+    3: "近似答案",
+}
+
+ACTION_EXPLAIN = "explain"
+ACTION_RETEACH = "reteach"
+ACTION_REFERENCE = "reference"
+ACTION_ASK = "ask"
+
+
+def hint_level_for(attempts: int) -> int:
+    """连续失败越多，默认给的提示越具体（FR-407 的"自动降级"）。
+
+    映射：还没答过 / 答错 1 次 → 1 级；答错 2 次 → 2 级；答错 3 次及以上 → 3 级。
+    刻意把第 1 级保留两次：第一次失败后直接上"关键要素"，等于把题目拆掉了。
+    """
+    return max(HINT_LEVEL_MIN, min(attempts, HINT_LEVEL_MAX))
+
+
+def hint_action(level: int) -> str:
+    return f"hint:{level}"
+
+
+def _clamp_level(level: int) -> int:
+    return max(HINT_LEVEL_MIN, min(level, HINT_LEVEL_MAX))
+
+
+def _parse_level(action: str) -> int:
+    _, _, raw = action.partition(":")
+    try:
+        return int(raw)
+    except ValueError:
+        return HINT_LEVEL_MIN
+
+
+def _hint_request_text(level: int, *, auto: bool) -> str:
+    """写进记忆的"用户请求"。
+
+    显式索要时写清级别，这样模型重读上下文时能看出它已经给过几级；
+    自动给级时用中性说法，避免让用户看到"你失败了 3 次"这类措辞（FR-210）。
+    """
+    if auto:
+        return "我有点卡住了，给我一点提示吧。"
+    return f"请给我第 {level} 级提示（{HINT_LEVEL_LABELS[level]}），不要直接给答案。"
+
+
+def _reteach_action(direction: str | None) -> str:
+    return f"{ACTION_RETEACH}:{direction}" if direction else ACTION_RETEACH
 
 
 class TeachingError(RuntimeError):
@@ -118,6 +180,10 @@ class TeachingTurn:
     decision_required: bool = False
     completed: bool = False
     attempts: int = 0
+    hint_level: int = 0
+    """本轮给出的提示级别（0 表示本轮不是提示）。"""
+    pending_question: str = ""
+    """提示/穿插提问后重新提醒的检查点问题（用于 ``hint`` 事件）。"""
     result: RoundResult | None = None
     error_message: str = ""
     error_category: str | None = None
@@ -269,6 +335,7 @@ class TeachingService:
                     **self._counter(path, node),
                 )
             self._state.mark_taught(subject_id)
+            self._state.set_last_action(subject_id, ACTION_EXPLAIN)
             session.persist()
             explanation_text = explanation.content
         else:
@@ -401,6 +468,7 @@ class TeachingService:
             self._mark_node_partial(subject_id, node, reason=WeakPointReason.SHOW_ANSWER)
             self._state.clear_decision(subject_id)
             self._state.clear_pending(subject_id)
+            self._state.set_last_action(subject_id, ACTION_REFERENCE)
             if not reference.ok:
                 return TeachingTurn(
                     result=reference,
@@ -490,6 +558,209 @@ class TeachingService:
         return self._state.transition(subject_id, SubjectState.TEACHING)
 
     # ------------------------------------------------------------------ #
+    # 分级提示（FR-407）
+    # ------------------------------------------------------------------ #
+
+    async def hint(
+        self,
+        subject_id: str,
+        *,
+        level: int | None = None,
+        on_delta: DeltaCallback | None = None,
+    ) -> TeachingTurn:
+        """给一级提示。用户可主动索取；不指定级别时按"连续失败次数"自动选级。
+
+        **提示不消耗尝试次数**：它是脚手架，不是作答。也不改变节点状态——
+        用户拿着提示答对了，判定仍然是独立的判定，该通过才通过。
+        """
+        snapshot, checkpoint_id, _question = self._state.require_pending_question(subject_id)
+        path = self._require_path(subject_id)
+        node = self._require_node(snapshot.current_node_id)
+        checkpoint = self._repos.paths.checkpoint(checkpoint_id)
+        if checkpoint is None:
+            raise TeachingError("待回答的检查点已失效，请点击「继续学习」重新提问。")
+
+        auto = level is None
+        chosen = hint_level_for(snapshot.node_attempts) if level is None else _clamp_level(level)
+
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        prompt = render(
+            TUTOR_HINT,
+            concept=self._require_subject(subject_id).title,
+            node_title=node.title,
+            objective=node.objective,
+            key_points=list(node.key_points),
+            question=checkpoint.question,
+            expected_points=list(checkpoint.expected_points),
+            history=self._answer_history(node.id),
+            level=chosen,
+            level_label=HINT_LEVEL_LABELS[chosen],
+            reason=(
+                f"（学习者已连续作答 {snapshot.node_attempts} 次未通过，系统自动给到这一级。）"
+                if auto and snapshot.node_attempts > 0
+                else "（学习者主动索要提示。）"
+            ),
+        )
+        session.memory.add_round().add(user_message(_hint_request_text(chosen, auto=auto)))
+        self._set_prompt(session, prompt)
+        result = await session.executor.stream("", on_delta=on_delta, purpose=LlmPurpose.TEACH)
+        session.persist()
+
+        if not result.ok:
+            return TeachingTurn(
+                result=result,
+                error_message=result.message,
+                error_category=result.error_category,
+                retryable=result.retryable,
+                node=node,
+                phase="hint",
+                attempts=snapshot.node_attempts,
+                **self._counter(path, node),
+            )
+
+        # 提示之后仍然保持"待回答同一个检查点"：这不是作答，问题不能变
+        self._state.set_last_action(subject_id, hint_action(chosen))
+        tail = QUESTION_TRANSITION + checkpoint.question
+        self._emit(on_delta, tail)
+
+        return TeachingTurn(
+            text=result.content + tail,
+            node=node,
+            phase="hint",
+            hint_level=chosen,
+            pending_question=checkpoint.question,
+            attempts=snapshot.node_attempts,
+            result=result,
+            **self._counter(path, node),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 自由提问（FR-411）
+    # ------------------------------------------------------------------ #
+
+    async def ask(
+        self,
+        subject_id: str,
+        question: str,
+        *,
+        on_delta: DeltaCallback | None = None,
+    ) -> TeachingTurn:
+        """穿插提问：先回答问题，再回到教学主线。
+
+        **绝不改变教学状态**：不写 ``answer_record``、不动尝试次数、不动待回答的检查点。
+        没有这条约束，用户随口问一句"这个和 XX 有什么区别"就会被当成检查点答案送去判定。
+
+        消息在记忆里标记为 :data:`KIND_OFF_TOPIC`，这样"教学主线"与"随口提问"
+        在存储层面就能分开（档案与日志都用得上）。
+
+        也**不写** ``last_action``：随口提问是岔路，"重新生成上一条"应该重跑主线上的那一句，
+        而不是把用户自己的问题再回答一遍。
+        """
+        text = (question or "").strip()
+        if not text:
+            return TeachingTurn(error_message="请先写下你的问题。", error_category="validation")
+
+        self._require_teaching_state(subject_id)
+        path = self._require_path(subject_id)
+        snapshot = self._state.snapshot(subject_id)
+        node = self._require_node(snapshot.current_node_id)
+        subject = self._require_subject(subject_id)
+
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session.memory.add_round().add(user_message(text), kind=KIND_OFF_TOPIC)
+        prompt = render(
+            TUTOR_OFF_TOPIC,
+            concept=subject.title,
+            node_title=node.title,
+            objective=node.objective,
+            question=snapshot.pending_question or "（当前没有待回答的检查点问题）",
+            off_topic_question=text,
+        )
+        self._set_prompt(session, prompt)
+        result = await session.executor.stream("", on_delta=on_delta, purpose=LlmPurpose.TEACH)
+        if result.ok:
+            # 标记必须落在**提交之后**的轮次上：执行器在快照上运行、成功后整体提交，
+            # 提交后 memory 里已经是新的轮次对象，先前持有的引用已经不在记忆里了。
+            for envelope in session.memory.rounds[-1].messages:
+                envelope.kind = KIND_OFF_TOPIC
+        session.persist()
+
+        if not result.ok:
+            return TeachingTurn(
+                result=result,
+                error_message=result.message,
+                error_category=result.error_category,
+                retryable=result.retryable,
+                node=node,
+                phase="off_topic",
+                attempts=snapshot.node_attempts,
+                **self._counter(path, node),
+            )
+
+        # 回到主线：把待答问题再说一遍，让用户知道接着做什么
+        tail = QUESTION_TRANSITION + snapshot.pending_question if snapshot.pending_question else ""
+        if tail:
+            self._emit(on_delta, tail)
+
+        return TeachingTurn(
+            text=result.content + tail,
+            node=node,
+            phase="off_topic",
+            attempts=snapshot.node_attempts,
+            result=result,
+            **self._counter(path, node),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 重新生成上一条回复（FR-413）
+    # ------------------------------------------------------------------ #
+
+    async def regenerate_last(self, subject_id: str, *, on_delta: DeltaCallback | None = None) -> TeachingTurn:
+        """按记录下来的"上一步动作"重跑一次，产出一条新的回复。
+
+        重生成**不撤销已发生的判定**：如果上一条回复是重讲或提示，说明用户已经答错过，
+        那些作答记录是事实，不该因为"再来一次"就消失。重生成只是换一种说法再说一遍。
+        """
+        self._require_teaching_state(subject_id)
+        action = self._state.snapshot(subject_id).last_action
+        if not action:
+            raise TeachingError("现在还没有可以重新生成的回复，请先让老师讲解或提问。")
+
+        if action == ACTION_EXPLAIN:
+            path = self._require_path(subject_id)
+            node = self._require_node(self._state.snapshot(subject_id).current_node_id)
+            session = self._sessions.open(subject_id, ConversationKind.TEACH)
+            result = await self._explain(subject_id, path, node, session, on_delta=on_delta)
+            if not result.ok:
+                return self._failure_turn(result, path, node, phase="explain")
+            return TeachingTurn(
+                text=result.content,
+                node=node,
+                phase="explain",
+                attempts=self._state.snapshot(subject_id).node_attempts,
+                result=result,
+                **self._counter(path, node),
+            )
+
+        if action.startswith("hint:"):
+            level = _clamp_level(_parse_level(action))
+            return await self.hint(subject_id, level=level, on_delta=on_delta)
+
+        direction = action.split(":", 1)[1] if ":" in action else None
+        path = self._require_path(subject_id)
+        node = self._require_node(self._state.snapshot(subject_id).current_node_id)
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        return await self._reteach(
+            subject_id,
+            path,
+            node,
+            session,
+            direction=direction,
+            on_delta=on_delta,
+            attempts=self._state.snapshot(subject_id).node_attempts,
+        )
+
+    # ------------------------------------------------------------------ #
     # 通过 / 未通过
     # ------------------------------------------------------------------ #
 
@@ -512,6 +783,8 @@ class TeachingService:
             self._state.set_pending_question(
                 subject_id, checkpoint_id=next_checkpoint.id, question=next_checkpoint.question
             )
+            # 上一条回复已经翻篇（继续问下一个检查点），不能再"重新生成"它
+            self._state.clear_last_action(subject_id)
             text = "答对了。\n\n" + QUESTION_TRANSITION + next_checkpoint.question
             self._emit(on_delta, text)
             return TeachingTurn(
@@ -655,6 +928,7 @@ class TeachingService:
 
         # 重讲后重新登记同一个检查点（FR-406：换角度重讲 → 再次提问）
         self._state.set_pending_question(subject_id, checkpoint_id=target.id, question=target.question)
+        self._state.set_last_action(subject_id, _reteach_action(direction))
         tail = QUESTION_TRANSITION + target.question
         self._emit(on_delta, tail)
 
@@ -768,6 +1042,39 @@ class TeachingService:
     # 内部工具
     # ------------------------------------------------------------------ #
 
+    def _failure_turn(
+        self,
+        result: RoundResult,
+        path: LearningPath,
+        node: KnowledgePoint,
+        *,
+        phase: str,
+    ) -> TeachingTurn:
+        """把一次失败的流式调用统一转成回合（不动任何状态）。"""
+        return TeachingTurn(
+            result=result,
+            error_message=result.message,
+            error_category=result.error_category,
+            retryable=result.retryable,
+            node=node,
+            phase=phase,
+            attempts=self._state.snapshot(path.subject_id).node_attempts,
+            **self._counter(path, node),
+        )
+
+    def _answer_history(self, node_id: str, *, limit: int = 5) -> str:
+        """把该节点最近的作答整理成提示词可用的紧凑文本。"""
+        records = self._repos.answers.list_for_node(node_id)[-limit:]
+        if not records:
+            return "（还没有作答记录）"
+        lines: list[str] = []
+        for record in records:
+            verdict = {"pass": "通过", "partial": "部分通过", "fail": "未通过"}.get(
+                record.verdict, record.verdict
+            )
+            lines.append(f"- 第 {record.attempt_index} 次（{verdict}）：{record.user_answer}")
+        return "\n".join(lines)
+
     def _resolve_node(self, path: LearningPath, snapshot: SessionSnapshot) -> KnowledgePoint | None:
         """确定当前该学的节点。
 
@@ -846,6 +1153,8 @@ class TeachingService:
         self._repos.weak_points.resolve(subject_id, node.id)
         self._state.clear_pending(subject_id)
         self._state.clear_decision(subject_id)
+        # 节点已完成，上一条回复不再属于当前进度
+        self._state.clear_last_action(subject_id)
         self._log.info(f"节点已掌握 subject={subject_id} node={node.id}")
 
     def _mark_node_partial(self, subject_id: str, node: KnowledgePoint, *, reason: WeakPointReason) -> None:

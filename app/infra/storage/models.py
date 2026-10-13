@@ -112,6 +112,11 @@ class MessageRow(Base):
     reasoning_content: Mapped[str | None] = mapped_column(Text)
     tool_calls_json: Mapped[str | None] = mapped_column(Text)
     is_summary: Mapped[bool] = mapped_column(Boolean, default=False)
+    kind: Mapped[str | None] = mapped_column(String(24))
+    """消息用途标记（v4）。目前用于区分检查点问答与"自由提问"（FR-411）。
+
+    它是**元信息**，不会进入发给模型的协议字典——与 ``is_summary`` 同理。
+    """
     token_count: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -167,6 +172,9 @@ class SessionStateRow(Base):
 
     ``awaiting_decision`` 记录"重试已耗尽、正在等用户三选一"这一事实。它必须落库而不是靠前端记忆：
     用户在这里关掉页面再打开，仍然要看到三个选项，而不是被重新讲一遍（FR-408）。
+
+    ``last_action`` 记录最近一次教学动作（``explain`` / ``reteach:simpler`` / ``hint:2`` …），
+    供"重新生成上一条回复"（FR-413）知道该重跑哪一个动作——不知道上一步做了什么就没法重跑。
     """
 
     __tablename__ = "session_state"
@@ -179,6 +187,7 @@ class SessionStateRow(Base):
     node_attempts: Mapped[int] = mapped_column(Integer, default=0)
     taught_node_id: Mapped[str | None] = mapped_column(String(36))
     awaiting_decision: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_action: Mapped[str | None] = mapped_column(String(32))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
