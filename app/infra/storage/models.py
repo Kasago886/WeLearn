@@ -9,7 +9,7 @@ learning_path / knowledge_point / checkpoint / answer_record / weak_point / stud
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -140,6 +140,8 @@ class UsageRecordRow(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # 单次模型调用耗时（FR-417 完成报告要统计累计耗时）
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
@@ -188,6 +190,13 @@ class SessionStateRow(Base):
     taught_node_id: Mapped[str | None] = mapped_column(String(36))
     awaiting_decision: Mapped[bool] = mapped_column(Boolean, default=False)
     last_action: Mapped[str | None] = mapped_column(String(32))
+    # 复习会话的进行中状态（FR-414、FR-503）。刻意与教学字段分开：
+    # 复习一个旧节点时若复用 current_node_id，用户回到教学页会发现自己"跳"到了那个旧节点。
+    review_mode: Mapped[str | None] = mapped_column(String(16))
+    review_node_id: Mapped[str | None] = mapped_column(String(36))
+    review_checkpoint_id: Mapped[str | None] = mapped_column(String(36))
+    # "为进入哪个节点已经做过回顾"（FR-414）。避免刷新后重复提问。
+    adjacent_review_for: Mapped[str | None] = mapped_column(String(36))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -290,6 +299,9 @@ class AnswerRecordRow(Base):
     hit_points_json: Mapped[str | None] = mapped_column(Text)
     missing_points_json: Mapped[str | None] = mapped_column(Text)
     attempt_index: Mapped[int] = mapped_column(Integer, default=1)
+    # 'teach' = 教学作答；'review' = 复习作答（FR-507）。
+    # server_default 与列级升级保持一致，这样"新建的库"和"升级来的库"取值口径相同。
+    source: Mapped[str] = mapped_column(String(16), default="teach", server_default=text("'teach'"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 

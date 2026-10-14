@@ -130,7 +130,12 @@ class SpikeContext:
     def executor(self, purpose: LlmPurpose = LlmPurpose.TEACH) -> RoundExecutor:
         """带用量统计的执行器：判定器这类走 StructuredChannel 的调用也计入 tally。"""
 
-        def on_usage(_purpose: LlmPurpose, _model: str, usage: TokenUsage | None) -> None:
+        def on_usage(
+            _purpose: LlmPurpose,
+            _model: str,
+            usage: TokenUsage | None,
+            _duration_ms: int | None = None,
+        ) -> None:
             self.tally.add(usage)
 
         return RoundExecutor(

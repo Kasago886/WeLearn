@@ -172,6 +172,7 @@ class SessionStateService:
 
         同时把 ``taught_node_id`` 清空——新节点尚未讲解，教学服务据此决定是否要生成讲解。
         ``last_action`` 也一并清空：上一条回复属于上一个节点，"重新生成"它没有意义（FR-413）。
+        复习字段同样清空：真正的"进入节点"意味着那次回顾已经结束了。
         """
         return self._sessions.update(
             subject_id,
@@ -182,6 +183,10 @@ class SessionStateService:
             pending_question=None,
             awaiting_decision=False,
             last_action=None,
+            review_mode=None,
+            review_node_id=None,
+            review_checkpoint_id=None,
+            adjacent_review_for=None,
         )
 
     def mark_taught(self, subject_id: str) -> SessionSnapshot:
@@ -222,6 +227,46 @@ class SessionStateService:
 
     def clear_decision(self, subject_id: str) -> SessionSnapshot:
         return self._sessions.update(subject_id, awaiting_decision=False)
+
+    # ------------------------------------------------------------------ #
+    # 复习（FR-414、FR-503）
+    # ------------------------------------------------------------------ #
+
+    def begin_review(
+        self,
+        subject_id: str,
+        *,
+        mode: str,
+        node_id: str,
+        checkpoint_id: str | None = None,
+    ) -> SessionSnapshot:
+        """进入一次复习会话。
+
+        复习状态与教学状态分开存：复习某个旧节点时**不动** ``current_node_id``，
+        否则用户回到教学页会发现自己"跳"到了那个旧节点上。
+        """
+        return self._sessions.update(
+            subject_id,
+            review_mode=mode,
+            review_node_id=node_id,
+            review_checkpoint_id=checkpoint_id,
+        )
+
+    def set_review_checkpoint(self, subject_id: str, *, checkpoint_id: str) -> SessionSnapshot:
+        return self._sessions.update(subject_id, review_checkpoint_id=checkpoint_id)
+
+    def end_review(self, subject_id: str) -> SessionSnapshot:
+        """结束复习，清空全部复习字段。"""
+        return self._sessions.update(
+            subject_id,
+            review_mode=None,
+            review_node_id=None,
+            review_checkpoint_id=None,
+        )
+
+    def mark_adjacent_review_done(self, subject_id: str, *, node_id: str) -> SessionSnapshot:
+        """记下"为进入该节点已经做过回顾"，避免刷新后重复提问（FR-414）。"""
+        return self._sessions.update(subject_id, adjacent_review_for=node_id)
 
     def increment_attempts(self, subject_id: str) -> int:
         """本轮节点的尝试次数 +1，返回新值。"""

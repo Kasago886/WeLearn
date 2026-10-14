@@ -160,6 +160,7 @@ def answer_payload(record: AnswerRecord) -> dict[str, Any]:
         "hit_points": list(record.hit_points),
         "missing_points": list(record.missing_points),
         "attempt_index": record.attempt_index,
+        "source": record.source,
         "created_at": iso(record.created_at),
     }
 

@@ -19,7 +19,9 @@ from app.api.deps import get_stack, require_subject
 from app.api.serializers import (
     answer_payload,
     assessment_payload,
+    iso,
     node_payload,
+    note_payload,
     path_payload,
     session_payload,
     subject_payload,
@@ -43,9 +45,16 @@ from app.contracts.events import (
     VerdictPayload,
     encode_frame,
 )
-from app.contracts.schemas import AssessmentStatus, ConversationKind, MasteryLevel, NodeDecision
-from app.services.learning.entities import KnowledgePoint
+from app.contracts.schemas import (
+    AssessmentStatus,
+    ConversationKind,
+    MasteryLevel,
+    NodeDecision,
+    NodeState,
+)
+from app.services.learning.entities import REVIEW_MODE_ADJACENT, KnowledgePoint
 from app.services.learning.planning import PlanningError
+from app.services.learning.review import ReviewError
 from app.services.learning.stack import LearningStack
 from app.services.learning.state import TransitionError
 from app.services.learning.teaching import HINT_LEVEL_LABELS
@@ -132,6 +141,18 @@ class AskRequest(BaseModel):
     """穿插提问（FR-411）。"""
 
     question: str = Field(min_length=1, max_length=2000)
+
+
+class ReviewStartRequest(BaseModel):
+    """从薄弱点清单发起一次复习（FR-503）。"""
+
+    node_id: str = Field(min_length=1, max_length=36)
+
+
+class NoteRequest(BaseModel):
+    """节点笔记（FR-801）。允许清空，因此不设最小长度。"""
+
+    content: str = Field(default="", max_length=20000)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,8 +289,247 @@ def get_state(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dic
 @router.get("/{subject_id}/weak-points")
 def list_weak_points(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
     require_subject(stack, subject_id)
-    points = stack.repos.weak_points.list_open(subject_id)
-    return {"items": [weak_point_payload(point) for point in points]}
+    overview = stack.reviews.overview(subject_id)
+    return {
+        "items": [
+            {
+                **weak_point_payload(item.weak_point),
+                "node_title": item.node_title,
+                "node_index": item.node_index,
+                "node_total": item.node_total,
+            }
+            for item in overview.items
+        ],
+        "node_total": overview.node_total,
+        "mastered_count": overview.mastered_count,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 复习（FR-502~FR-504、FR-507）
+# --------------------------------------------------------------------------- #
+
+
+def _review_turn_payload(turn: Any) -> dict[str, Any]:
+    return {
+        "text": turn.text,
+        "phase": turn.phase,
+        "mode": turn.mode,
+        "node": node_payload(turn.node) if turn.node is not None else None,
+        "verdict": turn.verdict,
+        "confidence": turn.confidence,
+        "feedback": turn.feedback,
+        "hit_points": list(turn.hit_points),
+        "missing_points": list(turn.missing_points),
+        "promoted": turn.promoted,
+        "resolved": turn.resolved,
+        "fail_count": turn.fail_count,
+        "suggestion": turn.suggestion,
+        "node_index": turn.node_index,
+        "node_total": turn.node_total,
+    }
+
+
+def _review_call(action: Callable[[], Any]) -> dict[str, Any]:
+    """把复习操作统一成"返回结果 + 领域错误转 409"。"""
+    try:
+        return _review_turn_payload(action())
+    except ReviewError as exc:
+        raise _conflict(exc) from exc
+
+
+@router.get("/{subject_id}/review")
+def review_overview(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
+    """薄弱点清单 + 进度（FR-502、FR-804）。"""
+    require_subject(stack, subject_id)
+    overview = stack.reviews.overview(subject_id)
+    return {
+        "items": [
+            {
+                **weak_point_payload(item.weak_point),
+                "node_title": item.node_title,
+                "node_index": item.node_index,
+                "node_total": item.node_total,
+            }
+            for item in overview.items
+        ],
+        "open_count": overview.open_count,
+        "node_total": overview.node_total,
+        "mastered_count": overview.mastered_count,
+        "current": (
+            _review_turn_payload(current)
+            if (current := stack.reviews.current(subject_id)) is not None
+            else None
+        ),
+    }
+
+
+@router.post("/{subject_id}/review/start")
+def review_start(
+    subject_id: str,
+    payload: ReviewStartRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """为某个节点开一次复习（FR-503）。复用该节点已有的检查点，因此不产生模型调用。"""
+    require_subject(stack, subject_id)
+    return _review_call(lambda: stack.reviews.start(subject_id, payload.node_id))
+
+
+@router.post("/{subject_id}/review/answer")
+async def review_answer(
+    subject_id: str,
+    payload: AskRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """提交复习作答：通过则升级为 ``mastered`` 并解除薄弱点（FR-503，AC-22）。"""
+    require_subject(stack, subject_id)
+    try:
+        return _review_turn_payload(await stack.reviews.answer(subject_id, payload.question))
+    except ReviewError as exc:
+        raise _conflict(exc) from exc
+
+
+@router.get("/{subject_id}/nodes/{node_id}/history")
+def node_history(
+    subject_id: str,
+    node_id: str,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """某节点的历次提问、作答、判定与反馈（FR-802）。"""
+    require_subject(stack, subject_id)
+    records = stack.repos.answers.list_for_node(node_id)
+    return {
+        "node_id": node_id,
+        "items": [answer_payload(record) for record in records],
+        "teach_count": sum(1 for record in records if record.source == "teach"),
+        "review_count": sum(1 for record in records if record.source == "review"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 学习档案与完成报告（FR-801、FR-802、FR-804、FR-417）
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/{subject_id}/archive")
+def archive(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
+    """学习档案总览：进度可视化 + 每个节点的笔记与作答计数（FR-801/802/804）。"""
+    require_subject(stack, subject_id)
+    subject = stack.subjects.get(subject_id)
+    path = stack.planning.current_path(subject_id)
+    nodes: list[dict[str, Any]] = []
+    if path is not None:
+        for node in path.ordered_nodes():
+            records = stack.repos.answers.list_for_node(node.id)
+            note = stack.repos.notes.get(subject_id, node.id)
+            nodes.append(
+                {
+                    **node_payload(node),
+                    "answer_count": len(records),
+                    "review_count": sum(1 for record in records if record.source == "review"),
+                    "note": note_payload(note) if note is not None else None,
+                }
+            )
+
+    progress = stack.subjects.progress(subject_id)
+    overview = stack.reviews.overview(subject_id)
+    return {
+        "subject": subject_payload(subject),
+        "path_id": path.id if path is not None else None,
+        "path_version": path.version if path is not None else None,
+        "nodes": nodes,
+        "progress": {
+            "mastered_nodes": progress.mastered_nodes,
+            "partial_nodes": progress.partial_nodes,
+            "skipped_nodes": progress.skipped_nodes,
+            "total_nodes": progress.total_nodes,
+            "mastery_ratio": progress.mastery_ratio,
+            "weak_points": progress.weak_points,
+            "total_tokens": progress.total_tokens,
+        },
+        "weak_points": [
+            {
+                **weak_point_payload(item.weak_point),
+                "node_title": item.node_title,
+            }
+            for item in overview.items
+        ],
+    }
+
+
+@router.put("/{subject_id}/nodes/{node_id}/note")
+def save_note(
+    subject_id: str,
+    node_id: str,
+    payload: NoteRequest,
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    """编辑节点笔记（FR-801）。
+
+    手动改写会覆盖自动生成的小结，因此 ``source`` 记为 ``user``——
+    否则"这段到底是模型写的还是我写的"就再也分不清了。
+    """
+    require_subject(stack, subject_id)
+    if stack.repos.paths.node(node_id) is None:
+        raise _conflict(PlanningError("这个节点已不存在（路径可能被重新生成过）。"))
+    content = payload.content.strip()
+    note = stack.repos.notes.upsert(subject_id, node_id, content, source="user")
+    return {"note": note_payload(note)}
+
+
+@router.get("/{subject_id}/report")
+def completion_report(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
+    """完成报告（FR-417）：三类清单 + 薄弱点 + 累计耗时与 token。"""
+    require_subject(stack, subject_id)
+    subject = stack.subjects.get(subject_id)
+    path = stack.planning.current_path(subject_id)
+    mastered: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    if path is not None:
+        for node in path.ordered_nodes():
+            entry = {"id": node.id, "index": node.order_index + 1, "title": node.title}
+            if node.state is NodeState.MASTERED:
+                mastered.append(entry)
+            elif node.state is NodeState.SKIPPED:
+                skipped.append(entry)
+            elif node.state is NodeState.PARTIAL:
+                # FR-417 要求标注"部分掌握"里哪些是用户选择放行的
+                reasons = [
+                    point.reason.value
+                    for point in stack.repos.weak_points.list_open(subject_id)
+                    if point.node_id == node.id
+                ]
+                partial.append({**entry, "reasons": reasons})
+
+    usage = stack.usage
+    summary = usage.summary(subject_id=subject_id)
+    overview = stack.reviews.overview(subject_id)
+    return {
+        "subject": subject_payload(subject),
+        "state": stack.state.snapshot(subject_id).state.value,
+        "mastered": mastered,
+        "partial": partial,
+        "skipped": skipped,
+        "weak_points": [
+            {**weak_point_payload(item.weak_point), "node_title": item.node_title}
+            for item in overview.items
+        ],
+        "usage": {
+            "calls": summary.calls,
+            "total_tokens": summary.total_tokens,
+            "reasoning_tokens": summary.reasoning_tokens,
+            "cached_prompt_tokens": summary.cached_prompt_tokens,
+            "cache_hit_rate": summary.cache_hit_rate,
+            # 累计模型调用耗时（FR-417）。这是"生成花了多久"，不含用户阅读时间。
+            "duration_ms": summary.duration_ms,
+        },
+        # 学习跨度：从建主题到最后一次活动。与上面的"累计耗时"是两个不同的量，
+        # 各有各的用处，所以分开给，不合并成一个含义模糊的"耗时"。
+        "started_at": iso(subject.created_at),
+        "last_activity_at": iso(subject.updated_at),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -772,6 +1032,29 @@ def teach_current(subject_id: str, stack: LearningStack = Depends(get_stack)) ->
         "answers": answers,
         # 最近一次教学动作；为空表示没有可"重新生成"的回复（FR-413）
         "last_action": view.snapshot.last_action,
+        # 正在进行"回顾上一节点"时给出提示与问题（FR-414）；否则为 null
+        "review": _review_payload(stack, subject_id, view.snapshot),
+    }
+
+
+def _review_payload(stack: LearningStack, subject_id: str, snapshot: Any) -> dict[str, Any] | None:
+    """把进行中的复习会话转成前端可直接渲染的载荷。
+
+    只有 ``adjacent``（进入新节点前的回顾）会出现在教学页；``weak`` 复习有自己的页面。
+    """
+    if snapshot.review_mode != REVIEW_MODE_ADJACENT or not snapshot.review_node_id:
+        return None
+    node = stack.repos.paths.node(snapshot.review_node_id)
+    checkpoint = (
+        stack.repos.paths.checkpoint(snapshot.review_checkpoint_id)
+        if snapshot.review_checkpoint_id
+        else None
+    )
+    return {
+        "mode": snapshot.review_mode,
+        "node_id": snapshot.review_node_id,
+        "node_title": node.title if node is not None else "",
+        "question": checkpoint.question if checkpoint is not None else "",
     }
 
 

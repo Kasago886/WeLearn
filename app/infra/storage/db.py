@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """当前表结构版本。
 
 - v1：设置、密钥、会话记忆、用量（P0/P1）。
@@ -27,6 +27,13 @@ SCHEMA_VERSION = 4
   - ``message.kind``：消息用途标记，用于把"自由提问"（FR-411）与检查点问答区分开；
   - ``session_state.last_action``：最近一次教学动作，供"重新生成上一条回复"（FR-413）
     知道该重跑哪一个动作——不知道上一步做了什么就没法重跑。
+- v5（P3B）：
+  - ``answer_record.source``：这次作答来自教学还是复习。没有它，档案页无法区分
+    "首次学会"与"复习通过"，复习记录（FR-507）也就无从统计；
+  - ``usage_record.duration_ms``：单次模型调用耗时，完成报告要统计累计耗时（FR-417）；
+  - ``session_state.review_mode`` / ``review_node_id`` / ``review_checkpoint_id``：
+    复习会话的进行中状态。**必须与教学状态分开存**——复习某个旧节点时如果复用
+    ``current_node_id``，用户回到教学页就会发现自己"跳"到了那个旧节点上。
 
 升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
 
@@ -41,6 +48,16 @@ _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     ("session_state", "awaiting_decision", "BOOLEAN NOT NULL DEFAULT 0"),
     ("session_state", "last_action", "VARCHAR(32)"),
     ("message", "kind", "VARCHAR(24)"),
+    # 带默认值很关键：老库里已有的作答全部来自教学，补列时必须回填成 'teach'，
+    # 否则它们的 source 会是 NULL，档案页据此分类就会漏掉这些记录。
+    ("answer_record", "source", "VARCHAR(16) NOT NULL DEFAULT 'teach'"),
+    ("usage_record", "duration_ms", "INTEGER"),
+    ("session_state", "review_mode", "VARCHAR(16)"),
+    ("session_state", "review_node_id", "VARCHAR(36)"),
+    ("session_state", "review_checkpoint_id", "VARCHAR(36)"),
+    # 记录"为了进入哪个节点已经做过回顾"（FR-414）。没有它会重复提问：
+    # 用户刷新后点「继续学习」，就会再被问一遍上一节点。
+    ("session_state", "adjacent_review_for", "VARCHAR(36)"),
 )
 
 

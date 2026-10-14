@@ -24,6 +24,8 @@ class UsageSummary:
     completion_tokens: int = 0
     reasoning_tokens: int = 0
     total_tokens: int = 0
+    # 累计模型调用耗时（毫秒）。FR-417 的完成报告要用它报"累计耗时"。
+    duration_ms: int = 0
 
     @property
     def cache_hit_rate(self) -> float:
@@ -55,6 +57,7 @@ class UsageRecorder:
         *,
         conversation_id: str | None = None,
         subject_id: str | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         """写入一条记录；``usage`` 为空时写入全 0 记录，以保留"这次调用发生过的"事实。"""
         payload = usage or TokenUsage()
@@ -71,6 +74,7 @@ class UsageRecorder:
                     completion_tokens=payload.completion_tokens,
                     reasoning_tokens=payload.reasoning_tokens,
                     total_tokens=payload.total_tokens,
+                    duration_ms=duration_ms,
                 )
             )
 
@@ -87,6 +91,7 @@ class UsageRecorder:
             func.coalesce(func.sum(UsageRecordRow.completion_tokens), 0),
             func.coalesce(func.sum(UsageRecordRow.reasoning_tokens), 0),
             func.coalesce(func.sum(UsageRecordRow.total_tokens), 0),
+            func.coalesce(func.sum(UsageRecordRow.duration_ms), 0),
         )
         if target is not None:
             statement = statement.where(UsageRecordRow.subject_id == target)
@@ -102,6 +107,7 @@ class UsageRecorder:
             completion_tokens=int(row[4]),
             reasoning_tokens=int(row[5]),
             total_tokens=int(row[6]),
+            duration_ms=int(row[7] or 0),
         )
 
     @staticmethod

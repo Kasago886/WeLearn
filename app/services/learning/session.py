@@ -75,9 +75,21 @@ class ConversationSessionFactory:
         conversation_id = self._memories.ensure_conversation(kind, subject_id=subject_id)
         memory = self._memories.load(conversation_id)
 
-        def on_usage(purpose: LlmPurpose, model: str, usage: TokenUsage | None) -> None:
+        def on_usage(
+            purpose: LlmPurpose,
+            model: str,
+            usage: TokenUsage | None,
+            duration_ms: int | None = None,
+        ) -> None:
             # 用量按主题聚合（FR-106 的进度概览需要），因此这里显式带上 subject_id
-            self._usage.record(purpose, model, usage, conversation_id=conversation_id, subject_id=subject_id)
+            self._usage.record(
+                purpose,
+                model,
+                usage,
+                conversation_id=conversation_id,
+                subject_id=subject_id,
+                duration_ms=duration_ms,
+            )
 
         executor = RoundExecutor(
             self._client,

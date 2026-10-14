@@ -70,7 +70,11 @@ async def test_stream_commits_user_and_assistant_messages() -> None:
     # 增量回调只推本次新增内容
     assert [event.content for event in deltas if event.content] == ["贝叶斯", "定理"]
 
-    assert usage_calls == [(LlmPurpose.TEACH, "deepseek-flash", USAGE)]
+    assert len(usage_calls) == 1
+    purpose, model, usage, duration_ms = usage_calls[0]
+    assert (purpose, model, usage) == (LlmPurpose.TEACH, "deepseek-flash", USAGE)
+    # 完成报告要统计累计耗时（FR-417），因此用量回调必须带上这次调用的耗时
+    assert isinstance(duration_ms, int) and duration_ms >= 0
 
 
 async def test_stream_passes_policy_parameters_to_client() -> None:
@@ -307,7 +311,10 @@ async def test_call_blocking_does_not_modify_memory() -> None:
     assert call.json_object is True
     assert call.max_tokens == 512
     assert call.purpose is LlmPurpose.JUDGE
-    assert usage_calls == [(LlmPurpose.JUDGE, "deepseek-flash", USAGE)]
+    assert len(usage_calls) == 1
+    purpose, model, usage, duration_ms = usage_calls[0]
+    assert (purpose, model, usage) == (LlmPurpose.JUDGE, "deepseek-flash", USAGE)
+    assert isinstance(duration_ms, int) and duration_ms >= 0
 
 
 async def test_usage_callback_failure_is_swallowed() -> None:

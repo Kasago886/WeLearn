@@ -40,6 +40,7 @@ from app.infra.storage.models import (
     utcnow,
 )
 from app.services.learning.entities import (
+    ANSWER_SOURCE_TEACH,
     AnswerRecord,
     Assessment,
     Checkpoint,
@@ -133,6 +134,10 @@ def _to_session(row: SessionStateRow) -> SessionSnapshot:
         taught_node_id=row.taught_node_id,
         awaiting_decision=bool(row.awaiting_decision),
         last_action=row.last_action,
+        review_mode=row.review_mode,
+        review_node_id=row.review_node_id,
+        review_checkpoint_id=row.review_checkpoint_id,
+        adjacent_review_for=row.adjacent_review_for,
         updated_at=row.updated_at,
     )
 
@@ -208,6 +213,7 @@ def _to_answer(row: AnswerRecordRow) -> AnswerRecord:
         hit_points=_load_list(row.hit_points_json),
         missing_points=_load_list(row.missing_points_json),
         attempt_index=row.attempt_index,
+        source=row.source or ANSWER_SOURCE_TEACH,
         created_at=row.created_at,
     )
 
@@ -448,6 +454,10 @@ class SessionStateRepository:
             "taught_node_id",
             "awaiting_decision",
             "last_action",
+            "review_mode",
+            "review_node_id",
+            "review_checkpoint_id",
+            "adjacent_review_for",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -977,6 +987,7 @@ class AnswerRepository:
         hit_points: Sequence[str] = (),
         missing_points: Sequence[str] = (),
         attempt_index: int = 1,
+        source: str = ANSWER_SOURCE_TEACH,
     ) -> AnswerRecord:
         row = AnswerRecordRow(
             subject_id=subject_id,
@@ -990,6 +1001,7 @@ class AnswerRepository:
             hit_points_json=_dump_list(hit_points),
             missing_points_json=_dump_list(missing_points),
             attempt_index=attempt_index,
+            source=source,
         )
         with self._db.session() as session:
             session.add(row)

@@ -17,6 +17,7 @@ working += 用户输入
 """
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -31,7 +32,18 @@ from app.services.llm.policy import ModelPolicy
 from app.services.llm.result import RoundResult
 
 DeltaCallback = Callable[[StreamEvent], None]
-UsageCallback = Callable[[LlmPurpose, str, TokenUsage | None], None]
+
+UsageCallback = Callable[[LlmPurpose, str, TokenUsage | None, int | None], None]
+"""用量回调：``(用途, 模型, 用量, 耗时毫秒)``。
+
+耗时随用量一起回调，是因为完成报告（FR-417）要报"累计耗时"，而"一次调用花了多久"
+只有执行器知道——客户端只负责发请求，不关心统计。
+"""
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, round((time.monotonic() - started) * 1000))
+
 
 
 class RoundExecutor:
@@ -107,6 +119,7 @@ class RoundExecutor:
         reasoning_parts: list[str] = []
         usage: TokenUsage | None = None
         interrupted = False
+        started = time.monotonic()
 
         try:
             async for event in self._client.stream_chat(
@@ -134,12 +147,13 @@ class RoundExecutor:
                 if on_delta is not None:
                     on_delta(event)
         except LlmError as exc:
-            return self._fail(exc, purpose, choice.model, usage)
+            return self._fail(exc, purpose, choice.model, usage, _elapsed_ms(started))
         except asyncio.CancelledError:
             # 硬取消：不提交，交由上层决定如何收尾
             self._log.warning(f"一轮对话被取消，未提交记忆 purpose={purpose.value}")
             raise
 
+        duration_ms = _elapsed_ms(started)
         content = "".join(content_parts)
         if not content.strip():
             # 用户按了停止、却恰好赶上流自己结束：循环里已经没机会再观察 stop_event，
@@ -154,6 +168,7 @@ class RoundExecutor:
                     purpose,
                     choice.model,
                     usage,
+                    duration_ms,
                 )
 
         return self._commit(
@@ -164,6 +179,7 @@ class RoundExecutor:
             purpose=purpose,
             model=choice.model,
             interrupted=interrupted,
+            duration_ms=duration_ms,
         )
 
     async def run(
@@ -178,6 +194,7 @@ class RoundExecutor:
         choice = self._policy.resolve(purpose)
         messages = build_outbound_messages(working, tools_enabled=self._tools_enabled)
 
+        started = time.monotonic()
         try:
             result = await self._client.chat(
                 model=choice.model,
@@ -189,7 +206,7 @@ class RoundExecutor:
                 timeout_seconds=choice.timeout_seconds,
             )
         except LlmError as exc:
-            return self._fail(exc, purpose, choice.model, None)
+            return self._fail(exc, purpose, choice.model, None, _elapsed_ms(started))
 
         reasoning_parts = [result.reasoning] if result.reasoning else []
         return self._commit(
@@ -200,6 +217,7 @@ class RoundExecutor:
             purpose=purpose,
             model=choice.model,
             interrupted=False,
+            duration_ms=_elapsed_ms(started),
         )
 
     async def call_blocking(
@@ -215,6 +233,7 @@ class RoundExecutor:
         这些调用自带完整上下文，不应污染教学记忆——因此它刻意绕过副本/提交流程。
         """
         choice = self._policy.resolve(purpose)
+        started = time.monotonic()
         result = await self._client.chat(
             model=choice.model,
             messages=messages,
@@ -225,7 +244,7 @@ class RoundExecutor:
             purpose=purpose,
             timeout_seconds=choice.timeout_seconds,
         )
-        self._record_usage(purpose, choice.model, result.usage)
+        self._record_usage(purpose, choice.model, result.usage, _elapsed_ms(started))
         return result.content, result.usage
 
     # ------------------------------------------------------------------ #
@@ -250,12 +269,13 @@ class RoundExecutor:
         purpose: LlmPurpose,
         model: str,
         interrupted: bool,
+        duration_ms: int | None = None,
     ) -> RoundResult:
         """提交点：写入 assistant 消息并整体替换正式记忆。"""
         reasoning = "".join(reasoning_parts)
         working.add_message_to_last_round(assistant_message(content, reasoning or None))
         self._memory.replace_with(working)
-        self._record_usage(purpose, model, usage)
+        self._record_usage(purpose, model, usage, duration_ms)
 
         if interrupted:
             self._log.info(f"生成被用户中断，已保留部分内容 purpose={purpose.value} chars={len(content)}")
@@ -268,24 +288,31 @@ class RoundExecutor:
         purpose: LlmPurpose,
         model: str,
         usage: TokenUsage | None,
+        duration_ms: int | None = None,
     ) -> RoundResult:
         """失败路径：**不提交记忆**（FR-610）。"""
         self._log.warning(
             f"一轮对话失败，未提交记忆 purpose={purpose.value} {error.category.value} detail={error.detail}"
         )
         # 失败的调用同样消耗了额度，用量仍需记录
-        self._record_usage(purpose, model, usage)
+        self._record_usage(purpose, model, usage, duration_ms)
         return RoundResult.failure(
             error.user_message,
             category=error.category.value,
             retryable=error.retryable,
         )
 
-    def _record_usage(self, purpose: LlmPurpose, model: str, usage: TokenUsage | None) -> None:
+    def _record_usage(
+        self,
+        purpose: LlmPurpose,
+        model: str,
+        usage: TokenUsage | None,
+        duration_ms: int | None = None,
+    ) -> None:
         if self._on_usage is None:
             return
         try:
-            self._on_usage(purpose, model, usage)
+            self._on_usage(purpose, model, usage, duration_ms)
         except Exception as exc:  # 统计属于旁路，失败不得影响对话
             self._log.warning(f"用量记录失败（已忽略）: {type(exc).__name__}: {exc}")
 

@@ -31,6 +31,23 @@ MOVABLE_NODE_STATES = FRESH_NODE_STATES
 而 ``teaching`` 依赖 ``planning``——从 teaching 导入会形成循环。
 """
 
+ANSWER_SOURCE_TEACH = "teach"
+ANSWER_SOURCE_REVIEW = "review"
+"""作答来源：教学 / 复习（FR-507）。
+
+复习作答与教学作答写在同一张表里（都带节点与检查点），靠这个字段区分。
+不这样做的话，"这个节点复习了几次、结果如何"就无从统计。
+"""
+
+REVIEW_MODE_ADJACENT = "adjacent"
+REVIEW_MODE_WEAK = "weak"
+"""复习会话的两种来源。
+
+``adjacent``：进入新节点前回顾上一节点（FR-414），答对即过、答错回到上一节点补强；
+``weak``：从薄弱点面板发起的针对性复习（FR-503），通过则解除该薄弱点。
+两者提问与判定机制相同，但**通过后的后果不同**，所以必须区分。
+"""
+
 
 @dataclass(frozen=True)
 class Subject:
@@ -93,7 +110,31 @@ class SessionSnapshot:
 
     "重新生成上一条回复"（FR-413）必须知道上一步做了什么，否则无从重跑。
     """
+    review_mode: str | None = None
+    """复习会话的类型：``adjacent``（进入新节点前回顾上一节点，FR-414）/
+    ``weak``（针对薄弱点的复习，FR-503）。为空表示当前不在复习。
+
+    与教学状态**分开存**：复习旧节点不该挪动 ``current_node_id``。
+    """
+    review_node_id: str | None = None
+    review_checkpoint_id: str | None = None
+    adjacent_review_for: str | None = None
+    """为进入哪个节点已经做过"回顾上一节点"（FR-414）。
+
+    没有它，用户刷新后点「继续学习」会被重复问一遍上一节点。
+    ``enter_node`` 会清空它，因此每个节点的进入只会回顾一次。
+    """
     updated_at: datetime | None = None
+
+    @property
+    def reviewing(self) -> bool:
+        """是否正在进行一次复习会话。"""
+        return self.review_mode is not None and self.review_node_id is not None
+
+    @property
+    def has_review_question(self) -> bool:
+        """复习是否停在"等用户回答"这一步。"""
+        return self.reviewing and self.review_checkpoint_id is not None
 
     @property
     def has_pending_question(self) -> bool:
@@ -221,6 +262,11 @@ class AnswerRecord:
     missing_points: tuple[str, ...]
     attempt_index: int
     created_at: datetime
+    source: str = "teach"
+    """``teach`` = 教学作答；``review`` = 复习作答（FR-507）。
+
+    档案页据此区分"首次学会"与"复习通过"，复习记录也靠它统计。
+    """
 
 
 @dataclass(frozen=True)

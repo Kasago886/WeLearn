@@ -893,12 +893,34 @@ def test_judgement_failure_keeps_pending_question(api: ApiHarness) -> None:
 
 
 def test_full_loop_completes_subject(api: ApiHarness) -> None:
-    """端到端：3 个节点全部通过后主题进入 completed。"""
+    """端到端：3 个节点全部通过后主题进入 completed。
+
+    从第二个节点起，进入前会先插入一次"回顾上一节点"（FR-414），
+    所以每轮要先通过回顾，才会拿到新节点的讲解与问题。
+    """
     subject_id = prepare_teaching(api, nodes=3)
 
     for index in range(3):
         script(api, stream=[f"讲解 {index}。"])
         api.client.post(f"/api/subjects/{subject_id}/teach/start")
+
+        current = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()
+        if current["review"] is not None:
+            # 回顾上一节点：判定通过后会接着讲解新节点并抛出问题
+            assert current["review"]["mode"] == "adjacent"
+            assert current["review"]["question"]
+            script(api, blocking=[verdict_json("pass")], stream=[f"讲解 {index}。"])
+            review_events = parse_sse(
+                api.client.post(
+                    f"/api/subjects/{subject_id}/teach/answer", json={"answer": f"回顾 {index}"}
+                ).text
+            )
+            assert not events_of(review_events, "error")
+            # 回顾通过后，教学状态没有被破坏：问题已经挂在新节点上
+            resumed = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()
+            assert resumed["review"] is None
+            assert resumed["session"]["pending_question"]
+
         script(api, stream=[f"小结 {index}。"], blocking=[verdict_json("pass")])
         events = parse_sse(
             api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": f"回答 {index}"}).text
@@ -1030,3 +1052,151 @@ def test_partial_verdict_triggers_reteach(api: ApiHarness) -> None:
     assert state["can_answer"] is True  # 可以再答一次
     assert state["node"]["state"] == "learning"  # 未通过不推进节点状态
     assert state["needs_decision"] is False  # 还没到重试上限
+
+
+# --------------------------------------------------------------------------- #
+# T3.3/T3.4 review and archive endpoints
+# --------------------------------------------------------------------------- #
+
+
+def test_archive_lists_nodes_with_note_and_answer_counts(api) -> None:
+    """FR-801/802/804：档案页要能一次拿到进度、每节点的笔记与作答数量。"""
+
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解一。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    script(api, stream=["小结。"], blocking=[verdict_json("pass")])
+    api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": "回答"})
+
+    body = api.client.get(f"/api/subjects/{subject_id}/archive").json()
+
+    assert body["subject"]["title"]
+    assert len(body["nodes"]) == 3
+    first = body["nodes"][0]
+    assert first["answer_count"] == 1
+    assert first["review_count"] == 0
+    assert first["note"]["content"]  # 通过后自动沉淀小结（FR-415）
+    assert first["note"]["source"] == "auto"
+    assert body["progress"]["mastered_nodes"] == 1
+    assert body["progress"]["mastery_ratio"] > 0
+
+
+def test_node_history_returns_every_attempt(api) -> None:
+    """FR-802：每个节点的历次提问、作答、判定与反馈都要能看到。"""
+
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解一。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    script(api, stream=["再讲。"], blocking=[verdict_json("fail")])
+    api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": "第一次"})
+
+    node_id = api.client.get(f"/api/subjects/{subject_id}/teach/current").json()["node"]["id"]
+    body = api.client.get(f"/api/subjects/{subject_id}/nodes/{node_id}/history").json()
+
+    assert body["node_id"] == node_id
+    assert len(body["items"]) == 1
+    record = body["items"][0]
+    assert record["answer"] == "第一次"
+    assert record["verdict"] == "fail"
+    assert record["question"]  # 提问也回放出来
+    assert record["feedback"]
+    assert record["source"] == "teach"
+    assert body["teach_count"] == 1
+    assert body["review_count"] == 0
+
+
+def test_note_can_be_edited_and_is_marked_as_user(api) -> None:
+    """FR-801：笔记可编辑；手写内容要标记来源，否则分不清是谁写的。"""
+
+    subject_id = prepare_teaching(api)
+    node_id = fetch_nodes(api, subject_id)[0]["id"]
+
+    saved = api.client.put(
+        f"/api/subjects/{subject_id}/nodes/{node_id}/note", json={"content": "我自己写的笔记"}
+    )
+    assert saved.status_code == 200
+    assert saved.json()["note"]["content"] == "我自己写的笔记"
+    assert saved.json()["note"]["source"] == "user"
+
+    body = api.client.get(f"/api/subjects/{subject_id}/archive").json()
+    assert body["nodes"][0]["note"]["content"] == "我自己写的笔记"
+
+
+def test_note_for_unknown_node_is_rejected(api) -> None:
+
+    subject_id = prepare_teaching(api)
+
+    response = api.client.put(f"/api/subjects/{subject_id}/nodes/nope/note", json={"content": "x"})
+
+    assert response.status_code == 409
+
+
+def test_completion_report_classifies_nodes_and_reports_usage(api) -> None:
+    """FR-417：报告要分三类列清单，并给出累计 token 与耗时。
+
+    这里让第一个节点在掌握后被跳过，于是同一份报告里应同时出现"已掌握"与"已跳过"，
+    而不是一个笼统的总数。
+    """
+
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解一。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    script(api, stream=["小结。"], blocking=[verdict_json("pass")])
+    api.client.post(f"/api/subjects/{subject_id}/teach/answer", json={"answer": "回答"})
+
+    body = api.client.get(f"/api/subjects/{subject_id}/report").json()
+    assert [item["index"] for item in body["mastered"]] == [1]
+
+    # 跳过的是**当前节点**：此刻当前节点正是刚掌握的节点 1，于是它变成"已跳过"
+    api.client.post(f"/api/subjects/{subject_id}/teach/skip")
+    after = api.client.get(f"/api/subjects/{subject_id}/report").json()
+
+    assert after["mastered"] == []
+    assert [item["index"] for item in after["skipped"]] == [1]
+    assert after["partial"] == []
+    assert after["weak_points"]  # 跳过会留下薄弱点（FR-409）
+    assert after["usage"]["calls"] > 0
+    for key in ("total_tokens", "reasoning_tokens", "cache_hit_rate", "duration_ms"):
+        assert key in after["usage"]
+    assert after["started_at"] and after["last_activity_at"]
+
+
+def test_review_pass_through_http_promotes_node(api) -> None:
+    """AC-22 的 HTTP 路径：复习通过 → 薄弱点已解决 + 节点升级为 ``mastered``。
+
+    这里用"跳过节点"制造薄弱点；``partial`` 成因的薄弱点由
+    ``tests/test_review_and_archive.py`` 的服务层用例覆盖（同一条复习代码路径）。
+    """
+
+    subject_id = prepare_teaching(api)
+    script(api, stream=["讲解一。"])
+    api.client.post(f"/api/subjects/{subject_id}/teach/start")
+    api.client.post(f"/api/subjects/{subject_id}/teach/skip")
+
+    node_id = fetch_nodes(api, subject_id)[0]["id"]
+    overview = api.client.get(f"/api/subjects/{subject_id}/review").json()
+    assert overview["open_count"] == 1
+    assert overview["items"][0]["node_id"] == node_id
+    assert overview["items"][0]["node_title"]
+
+    started = api.client.post(f"/api/subjects/{subject_id}/review/start", json={"node_id": node_id})
+    assert started.status_code == 200
+    assert started.json()["phase"] == "question"
+    assert started.json()["text"]
+
+    script(api, blocking=[verdict_json("pass")])
+    done = api.client.post(
+        f"/api/subjects/{subject_id}/review/answer", json={"question": "这次讲清楚了"}
+    ).json()
+
+    assert done["phase"] == "passed"
+    assert done["promoted"] is True and done["resolved"] is True
+    # 清单已空，节点已升级
+    assert api.client.get(f"/api/subjects/{subject_id}/review").json()["open_count"] == 0
+    node = next(item for item in fetch_nodes(api, subject_id) if item["id"] == node_id)
+    assert node["state"] == "mastered"
+    # FR-507：这次复习留下了记录，而且标成 review
+    history = api.client.get(f"/api/subjects/{subject_id}/nodes/{node_id}/history").json()
+    assert history["review_count"] == 1
+
+

@@ -55,6 +55,7 @@ from app.contracts.schemas import (
 from app.infra.deepseek.protocol import StreamEvent
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.infra.settings import AppSettings
+from app.infra.storage.models import utcnow
 from app.prompts import (
     TUTOR,
     TUTOR_FEEDBACK,
@@ -66,7 +67,9 @@ from app.prompts import (
 )
 from app.services.learning.assessment import AssessmentService
 from app.services.learning.entities import (
+    ANSWER_SOURCE_REVIEW,
     FRESH_NODE_STATES,
+    REVIEW_MODE_ADJACENT,
     TERMINAL_NODE_STATES,
     Checkpoint,
     KnowledgePoint,
@@ -304,6 +307,10 @@ class TeachingService:
                 **self._counter(path, node),
             )
 
+        # 正在等一次"回顾上一节点"的作答：把同一个问题再给一次，不要重新挑题
+        if snapshot.has_review_question:
+            return await self._resume_adjacent_review(subject_id, path, snapshot, on_delta=on_delta)
+
         node = self._resolve_node(path, snapshot)
         if node is None:
             # 全部节点都已完成
@@ -314,6 +321,13 @@ class TeachingService:
                 completed=True,
                 node_total=path.node_count,
             )
+
+        # FR-414：进入新节点前先快速回顾上一节点。答对才继续讲新节点，
+        # 答错则回到上一节点补强——不复习就直接往下讲，学过的会很快忘掉。
+        if snapshot.adjacent_review_for != node.id:
+            pending = self._adjacent_review_target(path, node)
+            if pending is not None:
+                return self._ask_adjacent_review(subject_id, path, node, pending, on_delta=on_delta)
 
         # FR-309：进入节点就算"学习中"。不标记的话节点列表会一直显示"未开始"，
         # 用户看不出自己正在学哪个节点。
@@ -370,6 +384,277 @@ class TeachingService:
         )
 
     # ------------------------------------------------------------------ #
+    # 相邻复习（FR-414、FR-501）
+    # ------------------------------------------------------------------ #
+
+    def _adjacent_review_target(
+        self,
+        path: LearningPath,
+        node: KnowledgePoint,
+    ) -> KnowledgePoint | None:
+        """该不该在进入 ``node`` 之前回顾上一节点？返回要回顾的节点。
+
+        条件是"上一节点确实被答过"——没答过就无从回顾。已掌握、部分掌握、跳过的节点
+        都算答过（跳过的节点也有作答记录），因为它们的检查点都问过。
+        """
+        previous = self._previous_node(path, node)
+        if previous is None:
+            return None
+        if self._repos.answers.count_for_node(previous.id) <= 0:
+            return None
+        return previous
+
+    @staticmethod
+    def _previous_node(path: LearningPath, node: KnowledgePoint) -> KnowledgePoint | None:
+        ordered = path.ordered_nodes()
+        for position, item in enumerate(ordered):
+            if item.id == node.id:
+                return ordered[position - 1] if position > 0 else None
+        return None
+
+    def _ask_adjacent_review(
+        self,
+        subject_id: str,
+        path: LearningPath,
+        node: KnowledgePoint,
+        previous: KnowledgePoint,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """抛出"回顾上一节点"的快速提问，暂不改动当前节点。"""
+        checkpoint = self._repos.paths.first_checkpoint(previous.id)
+        if checkpoint is None:
+            # 上一节点没有检查点就没法回顾，直接放行去讲新节点
+            self._state.mark_adjacent_review_done(subject_id, node_id=node.id)
+            return self._adjacent_skip_turn(subject_id, path, node, on_delta=on_delta)
+
+        self._state.begin_review(
+            subject_id,
+            mode=REVIEW_MODE_ADJACENT,
+            node_id=previous.id,
+            checkpoint_id=checkpoint.id,
+        )
+        text = (
+            f"在进入「{node.title}」之前，先快速回顾一下上一节「{previous.title}」。\n\n"
+            f"{checkpoint.question}"
+        )
+        self._emit(on_delta, text)
+        return TeachingTurn(
+            text=text,
+            node=node,
+            phase="review_question",
+            attempts=self._state.snapshot(subject_id).node_attempts,
+            **self._counter(path, node),
+        )
+
+    def _adjacent_skip_turn(
+        self,
+        subject_id: str,
+        path: LearningPath,
+        node: KnowledgePoint,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """没有可回顾的内容时，接着说清当前节点。"""
+        return TeachingTurn(
+            text="",
+            node=node,
+            phase="question",
+            attempts=self._state.snapshot(subject_id).node_attempts,
+            **self._counter(path, node),
+        )
+
+    async def _resume_adjacent_review(
+        self,
+        subject_id: str,
+        path: LearningPath,
+        snapshot: SessionSnapshot,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """刷新后再点「继续学习」：把同一个回顾问题再给一次。"""
+        node = self._repos.paths.node(snapshot.current_node_id) if snapshot.current_node_id else None
+        checkpoint = (
+            self._repos.paths.checkpoint(snapshot.review_checkpoint_id)
+            if snapshot.review_checkpoint_id
+            else None
+        )
+        if node is None or checkpoint is None:
+            # 节点或检查点已被删掉（例如路径被重新生成）：静默收尾，不要卡住
+            self._state.end_review(subject_id)
+            if node is not None:
+                return await self.start(subject_id, on_delta=on_delta)
+            raise TeachingError("当前节点已不存在，请重新生成学习路径。")
+
+        text = checkpoint.question
+        self._emit(on_delta, text)
+        return TeachingTurn(
+            text=text,
+            node=node,
+            phase="review_question",
+            attempts=snapshot.node_attempts,
+            **self._counter(path, node),
+        )
+
+    async def _answer_adjacent_review(
+        self,
+        subject_id: str,
+        text: str,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """处理"回顾上一节点"的作答：答对继续讲新节点，答错回到上一节点补强。"""
+        snapshot = self._state.snapshot(subject_id)
+        previous = self._require_node(snapshot.review_node_id)
+        checkpoint = (
+            self._repos.paths.checkpoint(snapshot.review_checkpoint_id)
+            if snapshot.review_checkpoint_id
+            else None
+        )
+        if checkpoint is None:
+            self._state.end_review(subject_id)
+            raise TeachingError("这次回顾的检查点已失效，请重新点击「继续学习」。")
+
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session.memory.add_round().add(user_message(text))
+        session.persist()
+
+        judgement, failure = await self._judge(previous, checkpoint, text, session)
+        if failure is not None:
+            # 判定故障：不动任何状态，用户直接重试
+            return TeachingTurn(
+                error_message=failure,
+                error_category="structured_output",
+                retryable=True,
+                node=previous,
+                phase="review_question",
+            )
+
+        assert judgement is not None
+        self._repos.answers.add(
+            subject_id=subject_id,
+            node_id=previous.id,
+            checkpoint_id=checkpoint.id,
+            question=checkpoint.question,
+            user_answer=text,
+            verdict=judgement.verdict.value,
+            confidence=judgement.confidence,
+            feedback=judgement.feedback,
+            hit_points=judgement.hit_points,
+            missing_points=judgement.missing_points,
+            attempt_index=self._repos.answers.count_for_node(previous.id),
+            source=ANSWER_SOURCE_REVIEW,
+        )
+
+        if judgement.verdict.value == "pass":
+            return await self._adjacent_passed(subject_id, previous, on_delta=on_delta)
+        return await self._adjacent_failed(
+            subject_id, previous, checkpoint, judgement, on_delta=on_delta
+        )
+
+    async def _adjacent_passed(
+        self,
+        subject_id: str,
+        previous: KnowledgePoint,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """答对：简述带过，接着进入新节点（FR-414）。"""
+        snapshot = self._state.snapshot(subject_id)
+        entering_id = snapshot.current_node_id or previous.id
+        self._state.end_review(subject_id)
+        self._state.mark_adjacent_review_done(subject_id, node_id=entering_id)
+        self._repos.paths.update_node(previous.id, last_reviewed_at=utcnow())
+
+        ack = f"回顾「{previous.title}」通过了，我们继续。\n\n"
+        self._emit(on_delta, ack)
+        turn = await self.start(subject_id, on_delta=on_delta)
+        turn.text = ack + turn.text
+        return turn
+
+    async def _adjacent_failed(
+        self,
+        subject_id: str,
+        previous: KnowledgePoint,
+        checkpoint: Checkpoint,
+        judgement: JudgementResult,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """答错：回到上一节点的补强流程（FR-414）。
+
+        做法是"切回上一节点 + 重新讲解 + 再次提问"，也就是 FR-406 的"换角度重讲 → 再次提问"。
+        同时记一个薄弱点，这样它会出现在复习页里，不会因为"只是个回顾题"而被放过。
+        """
+        missing = "、".join(judgement.missing_points)
+        reason = f"刚才回顾时还差：{missing}。" if missing else "刚才回顾时没答上来。"
+        self._state.end_review(subject_id)
+        self._repos.weak_points.record(subject_id, previous.id, WeakPointReason.PARTIAL)
+        # 回顾没答上来 = 其实并没有真正掌握，所以把它降回"学习中"再补一遍。
+        # **只清会话指针是不够的**：`_resolve_node` 会跳过终态节点，节点保持 mastered
+        # 的话下一句就会被解析回新节点，"回到上一节点补强"等于没发生。
+        self._repos.paths.update_node(previous.id, state=NodeState.LEARNING)
+        self._state.enter_node(subject_id, previous)
+        # 回到上一节点是"结果"，不是"又要进入新节点"：抑制它自己的回顾环节
+        self._state.mark_adjacent_review_done(subject_id, node_id=previous.id)
+
+        lead = f"这次回顾没过：{reason}\n\n我们回到「{previous.title}」再补一遍。\n\n"
+        self._emit(on_delta, lead)
+        path = self._require_path(subject_id)
+        return await self._reinforce(
+            subject_id, path, previous, checkpoint, lead, on_delta=on_delta
+        )
+
+    async def _reinforce(
+        self,
+        subject_id: str,
+        path: LearningPath,
+        node: KnowledgePoint,
+        checkpoint: Checkpoint,
+        lead: str,
+        *,
+        on_delta: DeltaCallback | None,
+    ) -> TeachingTurn:
+        """补强：重讲一遍，然后**重问同一个检查点**。
+
+        这里不能走 ``_next_checkpoint``：它返回"第一个尚未通过的检查点"，而上一节点的检查点
+        在之前的教学里已经通过过了，于是它会返回 ``None``，``start()`` 就按"无检查点=已掌握"
+        把节点又标回 mastered——刚降的级和刚记的薄弱点一起被抹掉，补强等于空转。
+        回顾失败恰恰说明"这道题现在答不上来"，所以重问它才是补强。
+        """
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        explanation = await self._explain(subject_id, path, node, session, on_delta=on_delta)
+        if not explanation.ok:
+            return TeachingTurn(
+                result=explanation,
+                error_message=explanation.message,
+                error_category=explanation.error_category,
+                retryable=explanation.retryable,
+                node=node,
+                phase="explain",
+                **self._counter(path, node),
+            )
+
+        self._state.mark_taught(subject_id)
+        self._state.set_last_action(subject_id, ACTION_EXPLAIN)
+        self._state.set_pending_question(
+            subject_id,
+            checkpoint_id=checkpoint.id,
+            question=checkpoint.question,
+        )
+        session.persist()
+
+        question_text = QUESTION_TRANSITION + checkpoint.question
+        self._emit(on_delta, question_text)
+        return TeachingTurn(
+            text=lead + explanation.content + question_text,
+            node=node,
+            phase="question",
+            attempts=self._state.snapshot(subject_id).node_attempts,
+            **self._counter(path, node),
+        )
+
+    # ------------------------------------------------------------------ #
     # 作答与判定
     # ------------------------------------------------------------------ #
 
@@ -387,6 +672,10 @@ class TeachingService:
                 error_message="请先写出你的回答。",
                 error_category="validation",
             )
+
+        # 正停在"回顾上一节点"上：这条回答属于那次回顾，不属于当前节点的检查点
+        if self._state.snapshot(subject_id).review_mode == REVIEW_MODE_ADJACENT:
+            return await self._answer_adjacent_review(subject_id, text, on_delta=on_delta)
 
         # 守卫会抛 AnswerNotAllowedError（没有待回答问题 / 正在等三选一 / 已暂停等）
         _snapshot, checkpoint_id, question = self._state.require_pending_question(subject_id)

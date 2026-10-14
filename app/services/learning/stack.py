@@ -13,6 +13,7 @@ from app.main_context import AppContext
 from app.services.learning.assessment import AssessmentService
 from app.services.learning.planning import PlanningService
 from app.services.learning.repository import DomainRepositories
+from app.services.learning.review import ReviewService
 from app.services.learning.session import ConversationSessionFactory
 from app.services.learning.state import SessionStateService
 from app.services.learning.subjects import SubjectService
@@ -33,6 +34,8 @@ class LearningStack:
     assessments: AssessmentService
     planning: PlanningService
     teaching: TeachingService
+    reviews: ReviewService
+    usage: UsageRecorder
     policy: ModelPolicy
     settings_provider: Callable[[], AppSettings]
     memories: MemoryRepository
@@ -74,6 +77,7 @@ def build_learning_stack(ctx: AppContext) -> LearningStack:
     assessments = AssessmentService(repos, state, sessions, settings_provider)
     planning = PlanningService(repos, state, sessions, assessments, settings_provider, policy)
     teaching = TeachingService(repos, state, sessions, planning, assessments, settings_provider)
+    reviews = ReviewService(repos, state, sessions, planning)
 
     return LearningStack(
         repos=repos,
@@ -82,6 +86,8 @@ def build_learning_stack(ctx: AppContext) -> LearningStack:
         assessments=assessments,
         planning=planning,
         teaching=teaching,
+        reviews=reviews,
+        usage=usage,
         policy=policy,
         settings_provider=settings_provider,
         memories=ctx.memories,
