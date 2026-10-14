@@ -1,20 +1,45 @@
-import { useEffect, useRef } from 'react'
+import { useLayoutEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 
 import { Markdown } from './Markdown'
 import { ReasoningPanel } from './Banner'
 
-export function Conversation({ children }: { children: ReactNode }) {
-  const endRef = useRef<HTMLDivElement | null>(null)
+/** 距底部多少像素内仍算"在看最新内容"。超出这个范围就认为用户在翻看历史，不该把他拽回来。 */
+const STICK_THRESHOLD_PX = 80
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end' })
+export function Conversation({ children }: { children: ReactNode }) {
+  const boxRef = useRef<HTMLDivElement | null>(null)
+  // 是否应该跟着新内容滚到底部。只由**用户的滚动**改变，不由内容变化改变。
+  const stickRef = useRef(true)
+
+  // 新内容出现时保持在底部。两处必须小心，否则会变成"每敲一个字整页往上跳"：
+  //
+  // 1. **直接设容器的 `scrollTop`，不要用 `scrollIntoView`**。后者会连同所有祖先滚动容器
+  //    一起滚——包括整个窗口；而且 `block: 'end'` 是"把底边对齐到视口底边"，不是"必要时才滚"，
+  //    所以它会把窗口往上拽，甚至把正在输入的框推出视口。容器自身的 `scrollTop` 只影响
+  //    这一个盒子，绝不碰窗口（已实测：赋值前后 `window.scrollY` 完全不变）。
+  // 2. **用"粘性标志"决定是否跟随，而不是每次去比高度差**。比高度差抓不住用户在两次渲染
+  //    之间的滚动，而且盒子从"不可滚动"变成"可滚动"时 `scrollTop` 还是 0，会被误判成
+  //    "用户滚远了"而拒绝跟随——明明那时用户就在底部。
+  //
+  // 用 `useLayoutEffect` 而不是 `useEffect`：滚动要在浏览器绘制前完成，否则会看到跳动。
+  useLayoutEffect(() => {
+    const box = boxRef.current
+    if (box === null) return
+    if (stickRef.current) {
+      box.scrollTop = box.scrollHeight
+    }
   })
 
+  function handleScroll(): void {
+    const box = boxRef.current
+    if (box === null) return
+    stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight <= STICK_THRESHOLD_PX
+  }
+
   return (
-    <div className="conversation">
+    <div className="conversation" ref={boxRef} onScroll={handleScroll}>
       {children}
-      <div ref={endRef} />
     </div>
   )
 }
