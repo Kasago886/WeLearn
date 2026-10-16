@@ -614,10 +614,14 @@ def assessment_view(subject_id: str, stack: LearningStack = Depends(get_stack)) 
     if view is None:
         return {"assessment": None, "transcript": [], "pending_question": None}
 
-    transcript: list[dict[str, str]] = []
-    if view.assessment.status is AssessmentStatus.RUNNING:
-        transcript = stack.transcript(subject_id, ConversationKind.ASSESS)
-    pending = transcript[-1]["content"] if transcript and transcript[-1]["role"] == "assistant" else None
+    # 对话记录一律返回：测评进行中用于刷新恢复（FR-410），结束后用于在画像页展开回顾（FR-208）
+    transcript = stack.transcript(subject_id, ConversationKind.ASSESS)
+    # ``pending_question`` 只在"还在提问"时有意义：测评结束后最后一条 assistant 是画像结论，
+    # 把它当成待答问题会让输入框错误地重新打开
+    running = view.assessment.status is AssessmentStatus.RUNNING
+    pending = (
+        transcript[-1]["content"] if running and transcript and transcript[-1]["role"] == "assistant" else None
+    )
 
     return {
         "assessment": assessment_payload(view.assessment, view.levels),

@@ -17,7 +17,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import select
 
-from app.contracts.schemas import ReasoningEffort
+from app.contracts.schemas import LlmPurpose, ReasoningEffort
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.infra.storage.db import Database
 from app.infra.storage.models import AppSettingsRow
@@ -36,6 +36,32 @@ def resolve_data_dir(env: Mapping[str, str] | None = None) -> Path:
     source = env if env is not None else os.environ
     raw = (source.get(ENV_DATA_DIR) or "").strip() or DEFAULT_DATA_DIR
     return Path(raw).expanduser()
+
+
+class PurposeOverride(BaseModel):
+    """单个用途的模型与思考档位覆盖（FR-703）。
+
+    取值用 ``"inherit"`` 表达"继承全局设置"，而不是用缺字段表达：前端渲染下拉框时
+    需要把"没覆盖"也显示成一项，缺字段会让它无处安放。
+    """
+
+    model: Literal["inherit", "default", "pro"] = "inherit"
+    thinking: Literal["inherit", "on", "off"] = "inherit"
+    reasoning_effort: Literal["inherit", "low", "high", "max"] = "inherit"
+
+    def to_policy_values(self) -> dict[str, object]:
+        """转成 :class:`~app.services.llm.policy.ModelPolicy` 的覆盖字典。
+
+        ``inherit`` 的项一律不下发——下发就等于"覆盖"，而策略层无法区分这两者。
+        """
+        values: dict[str, object] = {}
+        if self.model != "inherit":
+            values["model_field"] = "model_pro" if self.model == "pro" else "model_default"
+        if self.thinking != "inherit":
+            values["thinking"] = self.thinking == "on"
+        if self.reasoning_effort != "inherit":
+            values["reasoning_effort"] = ReasoningEffort(self.reasoning_effort)
+        return values
 
 
 class AppSettings(BaseModel):
@@ -62,6 +88,14 @@ class AppSettings(BaseModel):
     # 生效值，只读（见模块文档）
     data_dir: str = DEFAULT_DATA_DIR
     price_table: dict[str, float] = Field(default_factory=dict)
+    # 采样参数（FR-718）。默认值与官方默认一致：不显式配置时不改变模型行为。
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.01, le=1.0)
+    # 请求审计开关（FR-715）：默认关闭，需要排障时再开
+    audit_enabled: bool = False
+    # 按用途的模型与思考档位（FR-703）
+    use_recommended_overrides: bool = False
+    purpose_overrides: dict[LlmPurpose, PurposeOverride] = Field(default_factory=dict)
 
     def paths_inverted(self) -> bool:
         """路径节点数区间是否颠倒。"""
@@ -85,6 +119,9 @@ _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "log_level": (ENV_LOG_LEVEL, "str"),
 }
 
+# 以 JSON 文本落库的字段：读出来是字符串，校验前要先解析（脏数据按 FR-902 回退默认）
+_JSON_FIELDS = ("price_table", "purpose_overrides")
+
 
 def _sanitize(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """逐字段校验：只保留合法值，非法字段名进拒绝清单。"""
@@ -98,7 +135,7 @@ def _sanitize(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
         if value is None or (isinstance(value, str) and not value.strip()):
             continue
 
-        if name == "price_table" and isinstance(value, str):
+        if name in _JSON_FIELDS and isinstance(value, str):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
@@ -112,6 +149,25 @@ def _sanitize(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
             rejected.append(name)
 
     return clean, rejected
+
+
+def purpose_overrides_payload(settings: AppSettings) -> dict[str, dict[str, str]]:
+    """把五个用途全部补齐（缺的按"继承"表示）后交给前端。
+
+    刻意补齐而不是回显原始字典：前端要按固定形状渲染五组下拉框，缺项会让它自己补一套默认值，
+    两边的默认值一旦不一致，"界面显示继承、实际却覆盖了"这类问题就会变得很难查。
+    """
+    return {
+        purpose.value: (settings.purpose_overrides.get(purpose) or PurposeOverride()).model_dump()
+        for purpose in LlmPurpose
+    }
+
+
+def _purpose_overrides_json(settings: AppSettings) -> str:
+    return json.dumps(
+        {purpose.value: override.model_dump() for purpose, override in settings.purpose_overrides.items()},
+        ensure_ascii=False,
+    )
 
 
 class SettingsService:
@@ -147,6 +203,9 @@ class SettingsService:
 
         if diagnostics.rejected_fields:
             self._log.warning(f"设置中以下字段非法已回退默认值: {', '.join(diagnostics.rejected_fields)}")
+        if "purpose_overrides" in diagnostics.rejected_fields:
+            # 单项覆盖坏了就整份丢弃：只保住"部分用途"的覆盖会让人误判某个用途已经按预期配置
+            self._log.warning("用途级模型覆盖无法解析，已全部回退为继承全局设置")
 
         # data_dir 始终使用生效值
         settings = settings.model_copy(update={"data_dir": str(resolve_data_dir(self._env))})
@@ -192,6 +251,11 @@ class SettingsService:
             row.log_level = to_store.log_level
             row.data_dir = to_store.data_dir
             row.price_table_json = json.dumps(to_store.price_table, ensure_ascii=False)
+            row.temperature = to_store.temperature
+            row.top_p = to_store.top_p
+            row.audit_enabled = to_store.audit_enabled
+            row.use_recommended_overrides = to_store.use_recommended_overrides
+            row.purpose_overrides_json = _purpose_overrides_json(to_store)
             session.add(row)
 
         self._log.info("设置已保存")
@@ -228,6 +292,11 @@ class SettingsService:
                 "show_reasoning": row.show_reasoning,
                 "log_level": row.log_level,
                 "price_table": row.price_table_json,
+                "temperature": row.temperature,
+                "top_p": row.top_p,
+                "audit_enabled": row.audit_enabled,
+                "use_recommended_overrides": row.use_recommended_overrides,
+                "purpose_overrides": row.purpose_overrides_json,
             }
 
     def _apply_env(self, settings: AppSettings) -> tuple[AppSettings, list[str]]:

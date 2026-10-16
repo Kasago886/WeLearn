@@ -9,9 +9,12 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_context, get_stack
-from app.infra.settings import AppSettings
+from app.contracts.schemas import LlmPurpose
+from app.infra.settings import AppSettings, PurposeOverride, purpose_overrides_payload
 from app.main_context import AppContext
 from app.services.learning.stack import LearningStack
+from app.services.llm.policy import ModelPolicy, describe_model_plan
+from app.services.llm.usage import UsageSummary
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -35,6 +38,13 @@ class SettingsRequest(BaseModel):
     compress_round_count: int = Field(default=10, ge=1)
     show_reasoning: bool = False
     log_level: str = "INFO"
+    # 区间越界在这里被 pydantic 拦成 422（FR-718、AC-30：提交不报错但不生效的说法只针对
+    # "思考模式下参数被忽略"，取值越界仍属于非法输入）
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.01, le=1.0)
+    audit_enabled: bool = False
+    use_recommended_overrides: bool = False
+    purpose_overrides: dict[LlmPurpose, PurposeOverride] = Field(default_factory=dict)
 
 
 class ApiKeyRequest(BaseModel):
@@ -45,7 +55,7 @@ class TestConnectionRequest(BaseModel):
     model: str | None = None
 
 
-def _settings_payload(settings: AppSettings, ctx: AppContext) -> dict[str, Any]:
+def _settings_payload(settings: AppSettings, ctx: AppContext, policy: ModelPolicy) -> dict[str, Any]:
     return {
         "base_url": settings.base_url,
         "model_default": settings.model_default,
@@ -64,6 +74,15 @@ def _settings_payload(settings: AppSettings, ctx: AppContext) -> dict[str, Any]:
         "show_reasoning": settings.show_reasoning,
         "log_level": settings.log_level,
         "data_dir": settings.data_dir,
+        "temperature": settings.temperature,
+        "top_p": settings.top_p,
+        "audit_enabled": settings.audit_enabled,
+        "use_recommended_overrides": settings.use_recommended_overrides,
+        # 按用途覆盖：五个用途全部补齐，"继承"显式写出来，前端不必自己补默认值（FR-703）
+        "purpose_overrides": purpose_overrides_payload(settings),
+        # 只读：每个用途**实际**会用的参数。覆盖项写进去不等于生效（可能被推荐项或"继承"
+        # 改变结果），看不出来用户就会以为自己的设置没生效（FR-703、FR-718）
+        "model_plan": describe_model_plan(policy),
         # 数据目录只读；这两项告诉前端"哪些东西改了不生效"（FR-718）
         "read_only_fields": ["data_dir"],
         "api_key": {
@@ -75,8 +94,11 @@ def _settings_payload(settings: AppSettings, ctx: AppContext) -> dict[str, Any]:
 
 
 @router.get("/settings")
-def get_settings(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
-    return {"settings": _settings_payload(ctx.settings, ctx)}
+def get_settings(
+    ctx: AppContext = Depends(get_context),
+    stack: LearningStack = Depends(get_stack),
+) -> dict[str, Any]:
+    return {"settings": _settings_payload(ctx.settings, ctx, stack.policy)}
 
 
 @router.put("/settings")
@@ -103,7 +125,7 @@ def put_settings(
     saved = ctx.settings_service.save(candidate)
     ctx.refresh_settings(saved)
     stack.refresh_settings(saved)
-    return {"settings": _settings_payload(saved, ctx)}
+    return {"settings": _settings_payload(saved, ctx, stack.policy)}
 
 
 @router.put("/settings/api-key")
@@ -161,12 +183,8 @@ async def list_models(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
     }
 
 
-@router.get("/usage")
-def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
-    """全局用量与缓存命中率（FR-705）。命中率长期为 0 往往意味着前缀被改写。"""
-    from app.services.llm.usage import UsageRecorder
-
-    summary = UsageRecorder(ctx.db).summary()
+def _summary_payload(summary: UsageSummary) -> dict[str, Any]:
+    """一份聚合结果的对外形状：总量、按用途、按主题共用，避免三处口径写歪。"""
     return {
         "calls": summary.calls,
         "prompt_tokens": summary.prompt_tokens,
@@ -176,4 +194,40 @@ def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
         "reasoning_tokens": summary.reasoning_tokens,
         "total_tokens": summary.total_tokens,
         "cache_hit_rate": round(summary.cache_hit_rate, 4),
+        "duration_ms": summary.duration_ms,
+    }
+
+
+@router.get("/usage")
+def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
+    """全局用量、按用途/按主题聚合与缓存命中提示（FR-705）。
+
+    既有字段保持不变（向后兼容），新增字段只做加法。
+    """
+    from app.services.llm.usage import UsageRecorder, cache_hint
+
+    recorder = UsageRecorder(ctx.db)
+    summary = recorder.summary()
+    return {
+        "calls": summary.calls,
+        "prompt_tokens": summary.prompt_tokens,
+        "cached_prompt_tokens": summary.cached_prompt_tokens,
+        "cache_miss_tokens": summary.cache_miss_tokens,
+        "completion_tokens": summary.completion_tokens,
+        "reasoning_tokens": summary.reasoning_tokens,
+        "total_tokens": summary.total_tokens,
+        "cache_hit_rate": round(summary.cache_hit_rate, 4),
+        "by_purpose": {purpose: _summary_payload(item) for purpose, item in recorder.by_purpose().items()},
+        "by_subject": [
+            {
+                "subject_id": item.subject_id,
+                "title": item.title,
+                "calls": item.summary.calls,
+                "total_tokens": item.summary.total_tokens,
+                "cache_hit_rate": round(item.summary.cache_hit_rate, 4),
+                "duration_ms": item.summary.duration_ms,
+            }
+            for item in recorder.by_subject()
+        ],
+        "cache_hint": cache_hint(summary),
     }

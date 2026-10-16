@@ -1,4 +1,4 @@
-"""chat/completions 请求与响应协议（FR-701、FR-705、FR-716、FR-717）。
+"""chat/completions 请求与响应协议（FR-701、FR-705、FR-716、FR-717、FR-718）。
 
 请求体构建规则来自官方文档，有两条容易踩坑、这里显式处理：
 
@@ -6,9 +6,16 @@
    但部分兼容端点不接受 `"tools": null`；
 2. **`max_tokens` 在 JSON Output 场景必须显式设置**——否则 JSON 可能被中途截断（FR-716）。
 
-另有两条官方限制由上层负责（P1/P3 落地，见 FR-714、FR-718）：
-思考模式下不支持 `tool_choice=required` 与指定具体 tool；
-思考模式下 `temperature`/`presence_penalty`/`frequency_penalty` 不生效、`top_p` 被钳制到 0.95~1.0。
+采样参数（FR-718）按官方限制处理，这些限制体现在"下发什么"上：
+
+- 思考模式下 `temperature` / `presence_penalty` / `frequency_penalty` **不生效**
+  （设置不报错但会被忽略）——仍然照常下发 `temperature`，因为同一个值在关闭思考模式的
+  用途（如上下文压缩）下是有效的；
+- `top_p` **仅在思考模式下生效**，且有效范围被官方钳制到 `0.95`–`1.0`（低于 0.95 按 0.95 处理），
+  因此界面必须标注"当前配置下该参数不生效或已被钳制"，否则用户会误以为调参无效是 bug；
+- `presence_penalty` / `frequency_penalty` **本项目不使用**，一律不下发。
+
+另有两条官方限制由上层负责（FR-714）：思考模式下不支持 `tool_choice=required` 与指定具体 tool。
 """
 
 from collections.abc import Mapping, Sequence
@@ -21,6 +28,18 @@ from app.infra.deepseek.errors import LlmError
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 MODELS_PATH = "/models"
 BALANCE_PATH = "/user/balance"
+
+# 官方默认值：不显式配置时保持与"不下发"等价的行为
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 1.0
+
+
+@dataclass(frozen=True)
+class SamplingOptions:
+    """采样参数（FR-718）。默认值即官方默认，避免"顺手下发 0 温度"这类意外。"""
+
+    temperature: float = DEFAULT_TEMPERATURE
+    top_p: float = DEFAULT_TOP_P
 
 
 def build_endpoint(base_url: str, path: str) -> str:
@@ -101,6 +120,7 @@ def build_chat_request(
     max_tokens: int,
     json_object: bool = False,
     tools: Sequence[Mapping[str, Any]] | None = None,
+    sampling: SamplingOptions | None = None,
 ) -> dict[str, Any]:
     """构建 chat/completions 请求体。"""
     if not model.strip():
@@ -119,6 +139,11 @@ def build_chat_request(
 
     if max_tokens > 0:
         body["max_tokens"] = max_tokens
+
+    # 采样参数：只在调用方给出时下发（思考模式下会被官方忽略/钳制，见模块文档）
+    if sampling is not None:
+        body["temperature"] = sampling.temperature
+        body["top_p"] = sampling.top_p
 
     if json_object:
         body["response_format"] = {"type": "json_object"}

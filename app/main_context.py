@@ -9,12 +9,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from app.infra.deepseek.client import DeepSeekClient
+from app.infra.deepseek.protocol import SamplingOptions
 from app.infra.logging.queue_logger import CHANNEL_APP, QueueLogger, configure_logger, get_logger
 from app.infra.paths import DataPaths
 from app.infra.redaction import Redactor
 from app.infra.secrets import SecretStore
 from app.infra.settings import AppSettings, SettingsService, resolve_data_dir
 from app.infra.storage.db import Database
+from app.services.llm.policy import ModelPolicy
 from app.services.llm.repository import MemoryRepository
 
 DATABASE_FILENAME = "welearn.db"
@@ -40,6 +42,8 @@ class AppContext:
     redactor: Redactor
     logger: QueueLogger
     llm: DeepSeekClient
+    # 用途策略是**唯一实例**：领域服务与 API 都读它，刷新时才不会有谁还在用旧设置
+    policy: ModelPolicy
     memories: MemoryRepository
     env: Mapping[str, str]
 
@@ -49,8 +53,9 @@ class AppContext:
         return self.settings_holder["current"]
 
     def refresh_settings(self, settings: AppSettings) -> None:
-        """设置页保存后刷新内存快照，并同步客户端的重试与超时策略。"""
+        """设置页保存后刷新内存快照、重建用途策略，并同步客户端的重试与超时策略。"""
         self.settings_holder["current"] = settings
+        self.policy.reconfigure(settings)
         self.llm.update_policy(
             max_retries=settings.max_retries,
             timeout_seconds=settings.timeout_seconds,
@@ -97,6 +102,9 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
         redactor=redactor,
         max_retries=settings.max_retries,
         timeout_seconds=settings.timeout_seconds,
+        # 环境变量与运行期开关**取或**：环境变量是排障时"一定能开"的兜底手段（FR-715）
+        audit_getter=lambda: holder["current"].audit_enabled,
+        sampling_getter=lambda: _sampling_options(holder),
         log_payload=log_payload,
     )
 
@@ -110,6 +118,13 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
         redactor=redactor,
         logger=logger,
         llm=llm,
+        policy=ModelPolicy(settings),
         memories=MemoryRepository(db),
         env=source,
     )
+
+
+def _sampling_options(holder: Mapping[str, AppSettings]) -> SamplingOptions:
+    """采样参数按当前设置实时取值（FR-718），与 base_url 一样由 getter 注入。"""
+    current = holder["current"]
+    return SamplingOptions(temperature=current.temperature, top_p=current.top_p)

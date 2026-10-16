@@ -41,8 +41,8 @@ class LearningStack:
     memories: MemoryRepository
 
     def refresh_settings(self, settings: AppSettings) -> None:
-        """设置变更后同步用途策略（模型与思考档位）。"""
-        self.policy.update_settings(settings)
+        """设置变更后重新装配用途策略（模型与思考档位），无需重启即可生效（FR-703）。"""
+        self.policy.reconfigure(settings)
 
     def transcript(self, subject_id: str, kind: ConversationKind, *, limit: int | None = None) -> list[dict[str, str]]:
         """只读取回某用途的对话正文（刷新恢复用）。
@@ -60,7 +60,9 @@ def build_learning_stack(ctx: AppContext) -> LearningStack:
     """按环境装配学习领域服务。"""
     repos = DomainRepositories(ctx.db)
     settings_provider: Callable[[], AppSettings] = lambda: ctx.settings  # noqa: E731
-    policy = ModelPolicy(ctx.settings)
+    # 复用上下文里的策略实例（启动时已按设置装配好覆盖项），而不是另起一个：
+    # 两个实例会导致设置保存后有一部分调用仍按旧档位跑
+    policy = ctx.policy
 
     # 用量记录器不绑定主题，主题 id 在会话打开时按调用传入
     usage = UsageRecorder(ctx.db)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 
+from app.infra.settings import SettingsService
 from app.infra.storage.db import SCHEMA_VERSION, Database
 
 OLD_SESSION_STATE_DDL = """
@@ -59,6 +60,40 @@ CREATE TABLE usage_record (
     created_at DATETIME NOT NULL
 )
 """
+
+# v6 之前的样子：没有采样参数、审计开关与按用途覆盖
+OLD_APP_SETTINGS_DDL = """
+CREATE TABLE app_settings (
+    id INTEGER NOT NULL PRIMARY KEY,
+    base_url VARCHAR(300),
+    model_default VARCHAR(120),
+    model_pro VARCHAR(120),
+    thinking_enabled BOOLEAN,
+    reasoning_effort VARCHAR(16),
+    max_tokens INTEGER,
+    timeout_seconds INTEGER,
+    max_retries INTEGER,
+    assess_max_turns INTEGER,
+    path_min_nodes INTEGER,
+    path_max_nodes INTEGER,
+    node_max_retries INTEGER,
+    compress_threshold_rounds INTEGER,
+    compress_round_count INTEGER,
+    show_reasoning BOOLEAN,
+    log_level VARCHAR(16),
+    data_dir VARCHAR(500),
+    price_table_json TEXT,
+    updated_at DATETIME NOT NULL
+)
+"""
+
+V6_SETTINGS_COLUMNS = (
+    "temperature",
+    "top_p",
+    "audit_enabled",
+    "use_recommended_overrides",
+    "purpose_overrides_json",
+)
 
 
 def make_old_database(path: Path) -> Database:
@@ -151,6 +186,49 @@ def test_v5_columns_are_added_and_keep_existing_rows(tmp_path: Path) -> None:
         assert answer[2] == "teach"  # 新列取默认值：老记录都来自教学
         assert usage[0] == 100
         assert usage[1] is None  # 老记录没有耗时可言，留空而不是编一个 0
+    finally:
+        db.dispose()
+
+
+def test_v6_settings_columns_are_added_and_keep_existing_rows(tmp_path: Path) -> None:
+    """v6 的 5 个设置列必须能补到老库上，而且补完真的读得出来。
+
+    只升 ``SCHEMA_VERSION`` 而不登记 ``_COLUMN_UPGRADES`` 的话，已有库一读设置就会
+    "no such column" —— 老用户升级后打不开设置页正是这个原因。
+    """
+    db = Database.from_path(tmp_path / "welearn.db")
+    try:
+        with db.engine.begin() as connection:
+            connection.exec_driver_sql(OLD_APP_SETTINGS_DDL)
+            connection.exec_driver_sql(
+                "INSERT INTO app_settings (id, model_default, updated_at) "
+                "VALUES (1, 'deepseek-v4-pro', '2026-10-10 00:00:00')"
+            )
+        for column in V6_SETTINGS_COLUMNS:
+            assert column not in column_names(db, "app_settings")
+
+        db.init()
+
+        assert set(V6_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
+
+        service = SettingsService(db, {"WELEARN_DATA_DIR": str(tmp_path)})
+        settings = service.load()
+        assert settings.model_default == "deepseek-v4-pro"  # 老值原样保留
+        # 新列在老库上留空，读取时走默认值（FR-902：缺失即默认，不是报错）
+        assert settings.temperature == 1.0
+        assert settings.top_p == 1.0
+        assert settings.audit_enabled is False
+        assert settings.use_recommended_overrides is False
+        assert settings.purpose_overrides == {}
+    finally:
+        db.dispose()
+
+
+def test_v6_columns_exist_on_fresh_database(tmp_path: Path) -> None:
+    db = Database.from_path(tmp_path / "fresh.db")
+    try:
+        assert db.init() == 6
+        assert set(V6_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
     finally:
         db.dispose()
 

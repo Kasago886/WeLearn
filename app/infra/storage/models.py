@@ -58,6 +58,13 @@ class AppSettingsRow(Base):
     log_level: Mapped[str | None] = mapped_column(String(16))
     data_dir: Mapped[str | None] = mapped_column(String(500))
     price_table_json: Mapped[str | None] = mapped_column(Text)
+    # v6：采样参数（FR-718）、请求审计开关（FR-715）与按用途模型覆盖（FR-703）
+    temperature: Mapped[float | None] = mapped_column(Float)
+    top_p: Mapped[float | None] = mapped_column(Float)
+    audit_enabled: Mapped[bool | None] = mapped_column(Boolean)
+    use_recommended_overrides: Mapped[bool | None] = mapped_column(Boolean)
+    # 以 JSON 文本存：覆盖项形状随用途增加而扩展，加列不如加字段（与 price_table 同一取舍）
+    purpose_overrides_json: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 

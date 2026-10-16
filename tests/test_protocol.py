@@ -6,6 +6,7 @@ import pytest
 
 from app.infra.deepseek.errors import LlmError, LlmErrorCategory
 from app.infra.deepseek.protocol import (
+    SamplingOptions,
     TokenUsage,
     build_chat_request,
     build_endpoint,
@@ -106,6 +107,45 @@ def test_request_body_omits_max_tokens_when_zero() -> None:
         max_tokens=0,
     )
     assert "max_tokens" not in body
+
+
+def test_request_body_carries_sampling_params() -> None:
+    """FR-718：temperature 与 top_p 按设置下发；本项目不使用惩罚项，一律不下发。"""
+    body = build_chat_request(
+        model="deepseek-flash",
+        messages=[],
+        stream=False,
+        thinking=True,
+        reasoning_effort="high",
+        max_tokens=256,
+        sampling=SamplingOptions(temperature=0.7, top_p=0.9),
+    )
+
+    assert body["temperature"] == 0.7
+    assert body["top_p"] == 0.9
+    assert "presence_penalty" not in body
+    assert "frequency_penalty" not in body
+
+
+def test_request_body_omits_sampling_when_not_given() -> None:
+    """不传采样参数时不写进请求体：让官方默认值生效，而不是我们猜一个值。"""
+    body = build_chat_request(
+        model="deepseek-flash",
+        messages=[],
+        stream=False,
+        thinking=False,
+        reasoning_effort="high",
+        max_tokens=256,
+    )
+
+    assert "temperature" not in body
+    assert "top_p" not in body
+
+
+def test_default_sampling_options_match_official_defaults() -> None:
+    sampling = SamplingOptions()
+
+    assert (sampling.temperature, sampling.top_p) == (1.0, 1.0)
 
 
 def test_request_body_rejects_empty_model() -> None:

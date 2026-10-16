@@ -1,8 +1,9 @@
-"""DeepSeek HTTP 客户端（FR-701、FR-704、FR-709、FR-711、FR-712）。
+"""DeepSeek HTTP 客户端（FR-701、FR-704、FR-709、FR-711、FR-712、FR-715、FR-718）。
 
 设计要点：
 
-- **连接配置按需读取**：base_url / API Key 通过 getter 注入，设置页改完即时生效，无需重建客户端；
+- **连接配置按需读取**：base_url / API Key / 采样参数 / 审计开关都通过 getter 注入，
+  设置页改完即时生效，无需重建客户端；
 - **重试边界**：只在"尚未产出任何增量"时重试。已经吐给用户的流不重试，避免重复内容（FR-412）；
 - **错误统一为** :class:`LlmError`：状态码映射、网络异常、协议异常都不外泄原始堆栈；
 - **可注入**：实现 :class:`LlmClientProtocol`，测试可传入桩实现或 httpx.MockTransport（NFR-115）。
@@ -27,6 +28,7 @@ from app.infra.deepseek.protocol import (
     MODELS_PATH,
     BlockingResult,
     ModelInfo,
+    SamplingOptions,
     StreamEvent,
     build_chat_request,
     build_endpoint,
@@ -42,6 +44,8 @@ from app.infra.redaction import Redactor
 DEFAULT_BACKOFF_SECONDS = 0.5
 CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_TEST_TIMEOUT_SECONDS = 30
+# 审计正文的长度上限（FR-715）：审计是为了排障，不是做归档，超长正文会把日志通道撑爆
+AUDIT_TEXT_LIMIT = 4000
 
 
 @lru_cache(maxsize=1)
@@ -110,6 +114,8 @@ class DeepSeekClient:
         timeout_seconds: int = 60,
         backoff_base_seconds: float = DEFAULT_BACKOFF_SECONDS,
         log_payload: bool = False,
+        audit_getter: Callable[[], bool] | None = None,
+        sampling_getter: Callable[[], SamplingOptions] | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url_getter = base_url_getter
@@ -119,6 +125,8 @@ class DeepSeekClient:
         self._timeout_seconds = timeout_seconds
         self._backoff_base = backoff_base_seconds
         self._log_payload = log_payload
+        self._audit_getter = audit_getter
+        self._sampling_getter = sampling_getter
         self._log = get_logger(CHANNEL_LLM)
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
@@ -136,6 +144,22 @@ class DeepSeekClient:
             self._max_retries = max(0, max_retries)
         if timeout_seconds is not None:
             self._timeout_seconds = timeout_seconds
+
+    def audit_enabled(self) -> bool:
+        """当前是否记录完整请求体与完整响应（FR-715）。
+
+        **取或**：运行期设置 ``audit_enabled`` 或环境变量 ``WELEARN_LOG_LLM_PAYLOAD``——
+        环境变量保留为"一定能开"的兜底手段（配置文件坏了也能抓到一次现场）。
+        """
+        if self._log_payload:
+            return True
+        return bool(self._audit_getter is not None and self._audit_getter())
+
+    def _sampling(self) -> SamplingOptions:
+        """采样参数每次请求现取（FR-718）：与 base_url 一样不缓存，改了立刻生效。"""
+        if self._sampling_getter is None:
+            return SamplingOptions()
+        return self._sampling_getter()
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -223,8 +247,14 @@ class DeepSeekClient:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             json_object=json_object,
+            sampling=self._sampling(),
         )
         self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
+
+        # 审计时顺带把原始流攒起来，一轮结束时整段落日志（FR-715）；
+        # 不审计时一行业都不留，避免"关了开关还付一次拼接成本"
+        audit_enabled = self.audit_enabled()
+        audit_lines: list[str] = []
 
         last_usage = None
         try:
@@ -242,6 +272,8 @@ class DeepSeekClient:
                 parser = SseEventParser()
                 # 在同一异步循环中驱动同步解析器：忽略空行、`: keep-alive` 注释与其他字段行
                 async for line in response.aiter_lines():
+                    if audit_enabled:
+                        audit_lines.append(line)
                     payloads = parser.feed(line)
                     if parser.finished:
                         break
@@ -266,6 +298,9 @@ class DeepSeekClient:
         except httpx.HTTPError as exc:
             # 官方会在"请求发出后 10 分钟仍未开始推理"时关闭连接（FR-711）
             raise LlmError.network(f"{type(exc).__name__}: {exc}") from exc
+
+        if audit_enabled:
+            self._log_response(purpose, model, "\n".join(audit_lines))
 
         if last_usage is not None:
             self._log_usage(purpose, model, last_usage)
@@ -299,6 +334,7 @@ class DeepSeekClient:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             json_object=json_object,
+            sampling=self._sampling(),
         )
         self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
 
@@ -319,6 +355,8 @@ class DeepSeekClient:
                 if response.status_code >= 400:
                     error = self._error_from_response(response.status_code, response.content)
                 else:
+                    if self.audit_enabled():
+                        self._log_response(purpose, model, response.text)
                     result = self._parse_blocking(response)
                     if result.usage is not None:
                         self._log_usage(purpose, model, result.usage)
@@ -454,9 +492,22 @@ class DeepSeekClient:
             f"LLM 请求 purpose={purpose.value} model={model} messages={len(messages)} "
             f"thinking={thinking} effort={reasoning_effort} json={json_object}"
         )
-        if self._log_payload:
+        if self.audit_enabled():
             # 审计模式（FR-715）：请求体不含密钥，仍统一过一遍脱敏
-            self._log.debug(f"LLM 请求体: {self._redactor.truncate(json.dumps(body, ensure_ascii=False), 4000)}")
+            self._log.debug(
+                f"LLM 请求体: {self._redactor.truncate(json.dumps(body, ensure_ascii=False), AUDIT_TEXT_LIMIT)}"
+            )
+
+    def _log_response(self, purpose: LlmPurpose, model: str, raw: str) -> None:
+        """审计模式（FR-715）：记录完整响应。
+
+        同样过 :class:`Redactor`：响应体本不该带密钥，但"服务端回显了什么"恰好是排障要看的东西，
+        不能因为"理论上不会出现"就跳过脱敏。
+        """
+        self._log.debug(
+            f"LLM 响应体 purpose={purpose.value} model={model} "
+            f"body={self._redactor.truncate(raw, AUDIT_TEXT_LIMIT)}"
+        )
 
     def _log_usage(self, purpose: LlmPurpose, model: str, usage: Any) -> None:
         self._log.info(

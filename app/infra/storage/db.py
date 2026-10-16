@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 """当前表结构版本。
 
 - v1：设置、密钥、会话记忆、用量（P0/P1）。
@@ -34,6 +34,12 @@ SCHEMA_VERSION = 5
   - ``session_state.review_mode`` / ``review_node_id`` / ``review_checkpoint_id``：
     复习会话的进行中状态。**必须与教学状态分开存**——复习某个旧节点时如果复用
     ``current_node_id``，用户回到教学页就会发现自己"跳"到了那个旧节点上。
+- v6（P3C）：
+  - ``app_settings.temperature`` / ``top_p``：采样参数，需要落盘才能跨重启生效（FR-718）；
+  - ``app_settings.audit_enabled``：请求审计开关，必须与"环境变量强制开启"分开（FR-715）；
+  - ``app_settings.use_recommended_overrides`` / ``purpose_overrides_json``：按用途的
+    模型与思考档位覆盖（FR-703）。存 JSON 文本而不是逐用途加列：用途集合会随功能扩展，
+    加列意味着每次都要动表结构，而这一项的形状只由设置层解释。
 
 升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
 
@@ -58,6 +64,12 @@ _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     # 记录"为了进入哪个节点已经做过回顾"（FR-414）。没有它会重复提问：
     # 用户刷新后点「继续学习」，就会再被问一遍上一节点。
     ("session_state", "adjacent_review_for", "VARCHAR(36)"),
+    # 采样参数留空即可：读取时空值走默认（1.0），不必在 DDL 里编一个默认值。
+    ("app_settings", "temperature", "FLOAT"),
+    ("app_settings", "top_p", "FLOAT"),
+    ("app_settings", "audit_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("app_settings", "use_recommended_overrides", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("app_settings", "purpose_overrides_json", "TEXT"),
 )
 
 

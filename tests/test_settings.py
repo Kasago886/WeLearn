@@ -3,9 +3,12 @@
 import json
 from pathlib import Path
 
+from app.contracts.schemas import LlmPurpose
 from app.infra.settings import (
     AppSettings,
+    PurposeOverride,
     SettingsService,
+    purpose_overrides_payload,
     resolve_data_dir,
 )
 from app.infra.storage.db import Database
@@ -158,3 +161,73 @@ def test_corrupt_settings_json_does_not_break_startup(context: AppContext) -> No
     settings, _ = context.settings_service.load_with_diagnostics()
     assert settings.price_table == {}
     assert json.loads(json.dumps(settings.price_table)) == {}
+
+
+# --------------------------------------------------------------------------- #
+# P3C：采样参数、审计开关与按用途覆盖（FR-703、FR-715、FR-718）
+# --------------------------------------------------------------------------- #
+
+
+def test_sampling_and_audit_settings_round_trip(context: AppContext) -> None:
+    context.settings_service.save(
+        AppSettings(temperature=0.7, top_p=0.9, audit_enabled=True, use_recommended_overrides=True)
+    )
+
+    reloaded = context.settings_service.load()
+    assert reloaded.temperature == 0.7
+    assert reloaded.top_p == 0.9
+    assert reloaded.audit_enabled is True
+    assert reloaded.use_recommended_overrides is True
+
+
+def test_purpose_overrides_round_trip(context: AppContext) -> None:
+    """按用途覆盖必须落盘再读回一致（FR-703），否则重启后档位会悄悄变回默认。"""
+    context.settings_service.save(
+        AppSettings(
+            purpose_overrides={
+                LlmPurpose.JUDGE: PurposeOverride(model="pro", reasoning_effort="max"),
+                LlmPurpose.COMPRESS: PurposeOverride(thinking="off"),
+            }
+        )
+    )
+
+    reloaded = context.settings_service.load()
+    assert reloaded.purpose_overrides[LlmPurpose.JUDGE].model == "pro"
+    assert reloaded.purpose_overrides[LlmPurpose.JUDGE].reasoning_effort == "max"
+    assert reloaded.purpose_overrides[LlmPurpose.COMPRESS].thinking == "off"
+    # 没配置的用途就是"继承"，不能凭空多出一项
+    assert LlmPurpose.TEACH not in reloaded.purpose_overrides
+
+
+def test_purpose_overrides_payload_fills_every_purpose(context: AppContext) -> None:
+    """对外形状固定：五个用途都在，"继承"显式写出来，前端不必自己补默认值。"""
+    payload = purpose_overrides_payload(context.settings_service.load())
+
+    assert set(payload) == {"assess", "plan", "teach", "judge", "compress"}
+    assert payload["judge"] == {"model": "inherit", "thinking": "inherit", "reasoning_effort": "inherit"}
+
+
+def test_dirty_purpose_overrides_fall_back_to_all_inherit(context: AppContext) -> None:
+    """脏数据一律回退"全部继承"，且绝不抛异常（FR-902 的既有做法）。"""
+    broken_values = [
+        "{坏 JSON",
+        '["assess"]',  # 合法 JSON 但不是对象
+        '{"assess": {"model": "gpt-4"}}',  # 取值非法
+        '{"不存在的用途": {"model": "pro"}}',  # 用途非法
+        '{"assess": {"reasoning_effort": "turbo"}}',
+    ]
+    for broken in broken_values:
+        _write_raw(context, purpose_overrides_json=broken)
+        settings, diagnostics = context.settings_service.load_with_diagnostics()
+        assert settings.purpose_overrides == {}, broken
+        assert "purpose_overrides" in diagnostics.rejected_fields, broken
+
+
+def test_out_of_range_sampling_values_fall_back(context: AppContext) -> None:
+    """越界的采样参数只影响该字段（FR-718 的取值范围是 0~2 / 0.01~1）。"""
+    _write_raw(context, temperature=3.0, top_p=0.0)
+
+    settings, diagnostics = context.settings_service.load_with_diagnostics()
+    assert settings.temperature == 1.0
+    assert settings.top_p == 1.0
+    assert set(diagnostics.rejected_fields) >= {"temperature", "top_p"}

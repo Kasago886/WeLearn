@@ -1,11 +1,8 @@
 """按用途解析模型与思考参数（FR-703、FR-717）。
 
-P1 的行为是"全部继承全局设置"，但把**按用途覆盖**的扩展点先留好：
-T3.5 只需往 ``overrides`` 里填配置，不必改动调用方。
-
-默认建议（FR-703）：路径规划与判定用 `deepseek-v4-pro` + `effort=high`；
-上下文压缩关闭思考以省时省钱。这些默认值在 :data:`RECOMMENDED_OVERRIDES` 中给出，
-但**默认不启用**——是否启用属于设置项，由 T3.5 决定。
+默认行为是"全部继承全局设置"，按用途覆盖只有两类来源：
+推荐项（:data:`RECOMMENDED_OVERRIDES`，由设置开关 ``use_recommended_overrides`` 决定是否启用）
+与用户在设置页显式选择的覆盖项。**显式项压过推荐项**：推荐只是起点，用户选了就得听用户的。
 """
 
 from dataclasses import dataclass, replace
@@ -36,6 +33,20 @@ RECOMMENDED_OVERRIDES: dict[LlmPurpose, dict[str, object]] = {
 }
 
 
+def overrides_from_settings(settings: AppSettings) -> dict[LlmPurpose, dict[str, object]]:
+    """按设置装配覆盖项：推荐项打底，显式覆盖压顶（FR-703）。"""
+    overrides: dict[LlmPurpose, dict[str, object]] = {}
+    if settings.use_recommended_overrides:
+        overrides.update({purpose: dict(values) for purpose, values in RECOMMENDED_OVERRIDES.items()})
+
+    for purpose, override in settings.purpose_overrides.items():
+        values = override.to_policy_values()
+        if values:
+            overrides.setdefault(purpose, {}).update(values)
+
+    return overrides
+
+
 class ModelPolicy:
     """把全局设置 + 按用途覆盖解析为一次调用的具体参数。"""
 
@@ -45,18 +56,28 @@ class ModelPolicy:
         overrides: dict[LlmPurpose, dict[str, object]] | None = None,
     ) -> None:
         self._settings = settings
-        self._overrides = dict(overrides or {})
+        # 不传 overrides 时按设置推导：调用方（stack / AppContext）在构造处就不必记得"还要装配一次"
+        self._overrides = dict(overrides) if overrides is not None else overrides_from_settings(settings)
 
     @property
     def settings(self) -> AppSettings:
         return self._settings
 
     def update_settings(self, settings: AppSettings) -> None:
-        """设置页保存后同步（配合 AppContext.refresh_settings 使用）。"""
+        """只同步全局设置，保留已装配的覆盖项。"""
         self._settings = settings
 
+    def reconfigure(self, settings: AppSettings) -> None:
+        """按新设置重新装配覆盖项（设置保存后调用，无需重启，FR-703）。
+
+        覆盖项**整体重建**而不是增量合并：关掉推荐开关、或把某项改回"继承"之后，
+        旧覆盖项若还留着，界面显示与实际行为就会不一致。
+        """
+        self._settings = settings
+        self._overrides = overrides_from_settings(settings)
+
     def set_override(self, purpose: LlmPurpose, values: dict[str, object]) -> None:
-        """设置某用途的覆盖项（T3.5 的接入点）。"""
+        """设置某用途的覆盖项（推荐项与显式覆盖都经由此处）。"""
         merged = dict(self._overrides.get(purpose, {}))
         merged.update(values)
         self._overrides[purpose] = merged
@@ -92,10 +113,27 @@ class ModelPolicy:
 
 
 def apply_recommended_overrides(policy: ModelPolicy) -> ModelPolicy:
-    """启用推荐覆盖（T3.5 在设置项打开时调用）。"""
+    """启用推荐覆盖（设置项 ``use_recommended_overrides`` 打开时调用）。"""
     for purpose, values in RECOMMENDED_OVERRIDES.items():
         policy.set_override(purpose, dict(values))
     return policy
+
+
+def describe_model_plan(policy: ModelPolicy) -> dict[str, dict[str, object]]:
+    """每个用途**实际**会用的参数（FR-703 的可核对性）。
+
+    只读展示是必需的：覆盖项写进设置里不等于生效（可能被推荐项压过、也可能因为"继承"
+    而回落到全局），前端不把解析结果摊开，用户就只能靠猜。
+    """
+    plan: dict[str, dict[str, object]] = {}
+    for purpose in LlmPurpose:
+        choice = policy.resolve(purpose)
+        plan[purpose.value] = {
+            "model": choice.model,
+            "thinking": choice.thinking,
+            "reasoning_effort": choice.reasoning_effort,
+        }
+    return plan
 
 
 def replace_choice(choice: ModelChoice, **changes: object) -> ModelChoice:

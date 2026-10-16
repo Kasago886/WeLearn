@@ -5,6 +5,7 @@
 
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,7 +13,9 @@ import pytest
 from app.contracts.schemas import LlmPurpose
 from app.infra.deepseek.client import DeepSeekClient
 from app.infra.deepseek.errors import LlmError, LlmErrorCategory
-from app.infra.deepseek.protocol import StreamEvent
+from app.infra.deepseek.protocol import SamplingOptions, StreamEvent
+from app.infra.logging import queue_logger
+from app.infra.logging.queue_logger import QueueLogger
 from app.infra.redaction import Redactor
 from tests.conftest import ClientFactory, fixture_text
 
@@ -404,3 +407,150 @@ async def test_update_policy_changes_retry_behavior(make_client: ClientFactory) 
         await client.chat(model="deepseek-flash", messages=[])
 
     assert calls == 2
+
+
+# --------------------------------------------------------------------------- #
+# 采样参数下发（FR-718）
+# --------------------------------------------------------------------------- #
+
+
+async def test_sampling_params_come_from_the_getter(make_client: ClientFactory) -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=fixture_text("stream_normal.sse").encode("utf-8"))
+
+    client = make_client(handler, sampling_getter=lambda: SamplingOptions(temperature=0.3, top_p=0.95))
+    await _collect(client)
+
+    assert captured[0]["temperature"] == 0.3
+    assert captured[0]["top_p"] == 0.95
+
+
+async def test_sampling_params_default_when_no_getter(make_client: ClientFactory) -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=fixture_text("stream_normal.sse").encode("utf-8"))
+
+    client = make_client(handler)
+    await _collect(client)
+
+    assert captured[0]["temperature"] == 1.0
+    assert captured[0]["top_p"] == 1.0
+
+
+async def test_sampling_getter_is_read_per_request(make_client: ClientFactory) -> None:
+    """每次请求现取（FR-718）：设置页改完不需要重建客户端。"""
+    captured: list[dict[str, object]] = []
+    current = {"temperature": 0.2}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=fixture_text("stream_normal.sse").encode("utf-8"))
+
+    client = make_client(handler, sampling_getter=lambda: SamplingOptions(temperature=current["temperature"]))
+    await _collect(client)
+    current["temperature"] = 1.7
+    await _collect(client)
+
+    assert [body["temperature"] for body in captured] == [0.2, 1.7]
+
+
+# --------------------------------------------------------------------------- #
+# 请求审计（FR-715）
+# --------------------------------------------------------------------------- #
+
+
+def _audit_logger(tmp_path: Path, redactor: Redactor) -> QueueLogger:
+    return QueueLogger(tmp_path, level="DEBUG", redactor=redactor)
+
+
+async def test_audit_logs_full_request_and_response_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """开关打开时能看到完整请求体与响应体，且两者都经过脱敏（FR-715、FR-708）。"""
+    redactor = Redactor()
+    redactor.register(API_KEY)
+    logger = _audit_logger(tmp_path, redactor)
+    monkeypatch.setattr(queue_logger, "_LOGGER", logger)
+    try:
+        # 响应体里刻意回显 Key（模拟服务端把请求头回显出来），以验证脱敏真的生效
+        body = fixture_text("stream_normal.sse")
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=(f": {API_KEY}\n{body}").encode())
+
+        client = make_client(handler, redactor=redactor, audit_getter=lambda: True)
+        await _collect(client)
+        assert logger.flush()
+    finally:
+        logger.close()
+
+    text = (tmp_path / "llm.log").read_text(encoding="utf-8")
+    assert "LLM 请求体" in text
+    assert '"role": "user"' in text  # 审计记的是完整请求体，不只是"发生过一次请求"
+    assert "LLM 响应体" in text
+    assert "贝叶斯定理" in text  # 响应正文也在日志里
+    assert API_KEY not in text
+
+
+async def test_audit_is_silent_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """默认关闭：不审计时一行正文都不写，避免正常运行时把日志刷满。"""
+    redactor = Redactor()
+    redactor.register(API_KEY)
+    logger = _audit_logger(tmp_path, redactor)
+    monkeypatch.setattr(queue_logger, "_LOGGER", logger)
+    try:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=fixture_text("stream_normal.sse").encode("utf-8"))
+
+        client = make_client(handler, redactor=redactor)
+        await _collect(client)
+        assert logger.flush()
+    finally:
+        logger.close()
+
+    text = (tmp_path / "llm.log").read_text(encoding="utf-8")
+    assert "LLM 请求 purpose=" in text  # 常规日志仍在
+    assert "LLM 请求体" not in text
+    assert "LLM 响应体" not in text
+
+
+async def test_environment_variable_forces_audit_on(make_client: ClientFactory) -> None:
+    """环境变量是与运行期设置**取或**的强制手段：配置文件坏了也能抓到一次现场。"""
+    client = make_client(lambda _r: _ok_blocking(), log_payload=True)
+
+    assert client.audit_enabled() is True
+
+
+async def test_audit_getter_is_read_per_request(make_client: ClientFactory) -> None:
+    enabled = {"value": False}
+    client = make_client(lambda _r: _ok_blocking(), audit_getter=lambda: enabled["value"])
+
+    assert client.audit_enabled() is False
+    enabled["value"] = True
+    assert client.audit_enabled() is True
+
+
+async def test_blocking_audit_logs_response_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_client: ClientFactory
+) -> None:
+    """非流式（判定、压缩）也必须记到响应体，否则审计只覆盖一半调用。"""
+    redactor = Redactor()
+    logger = _audit_logger(tmp_path, redactor)
+    monkeypatch.setattr(queue_logger, "_LOGGER", logger)
+    try:
+        client = make_client(lambda _r: _ok_blocking("判定通过"), redactor=redactor, audit_getter=lambda: True)
+        await client.chat(model="deepseek-flash", messages=[{"role": "user", "content": "hi"}])
+        assert logger.flush()
+    finally:
+        logger.close()
+
+    text = (tmp_path / "llm.log").read_text(encoding="utf-8")
+    assert "LLM 响应体" in text
+    assert "判定通过" in text
