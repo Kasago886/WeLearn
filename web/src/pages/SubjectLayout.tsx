@@ -10,6 +10,8 @@ const STAGES = [
   { path: 'assessment', label: '知识基础确认' },
   { path: 'path', label: '学习路径' },
   { path: 'teach', label: '教学' },
+  { path: 'review', label: '薄弱点复习' },
+  { path: 'archive', label: '学习档案' },
 ]
 
 /**

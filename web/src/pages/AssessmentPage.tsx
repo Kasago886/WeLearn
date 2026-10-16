@@ -30,6 +30,8 @@ function ProfilePanel({ regenerate, onOverridden }: { regenerate: boolean; onOve
   const [problem, setProblem] = useState<string | null>(null)
 
   const assessment = data?.assessment ?? null
+  // 测评对话完整保存着（FR-208）：画像页要能展开回顾"当时是怎么被问、怎么答的"
+  const transcript: ChatMessage[] = data?.transcript ?? EMPTY_TRANSCRIPT
 
   if (loading) return <Spinner label="正在加载画像…" />
   if (error) return <Banner onRetry={reload}>{error}</Banner>
@@ -102,6 +104,26 @@ function ProfilePanel({ regenerate, onOverridden }: { regenerate: boolean; onOve
           </table>
         )}
       </div>
+
+      {transcript.length > 0 ? (
+        <div className="card">
+          <details>
+            <summary>测评过程回顾（{transcript.length} 条）</summary>
+            <p className="muted small">
+              下面是这次知识基础确认的完整问答；画像里的每个水平都来自其中的具体表现。
+            </p>
+            <Conversation>
+              {transcript.map((item, index) =>
+                item.role === 'user' ? (
+                  <UserBubble key={`r-u-${index}`} text={item.content} />
+                ) : (
+                  <AssistantText key={`r-a-${index}`} text={item.content} />
+                ),
+              )}
+            </Conversation>
+          </details>
+        </div>
+      ) : null}
 
       <div className="btn-row">
         <button

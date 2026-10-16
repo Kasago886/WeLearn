@@ -1,9 +1,11 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 
+import { ArchivePage } from './pages/ArchivePage'
 import { AssessmentPage } from './pages/AssessmentPage'
 import { NewSubjectPage } from './pages/NewSubjectPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { PathPage } from './pages/PathPage'
+import { ReviewPage } from './pages/ReviewPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StageRedirect } from './pages/StageRedirect'
 import { SubjectLayout } from './pages/SubjectLayout'
@@ -39,6 +41,8 @@ export default function App() {
             <Route path="assessment" element={<AssessmentPage />} />
             <Route path="path" element={<PathPage />} />
             <Route path="teach" element={<TeachingPage />} />
+            <Route path="review" element={<ReviewPage />} />
+            <Route path="archive" element={<ArchivePage />} />
           </Route>
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

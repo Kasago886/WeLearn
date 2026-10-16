@@ -6,20 +6,26 @@
 
 import { api } from './client'
 import type {
+  ArchiveView,
   AssessmentView,
+  CompletionReport,
   Health,
   LearningPath,
   ModelInfo,
+  NodeHistory,
   PathView,
   Progress,
+  ReviewOverview,
+  ReviewTurn,
   Settings,
+  StudyNote,
   Subject,
   SubjectListItem,
   SubjectStateView,
   TeachingView,
   TestConnectionResult,
   UsageSummary,
-  WeakPoint,
+  WeakPointWithNode,
 } from './types'
 
 export interface SubjectCreatePayload {
@@ -41,7 +47,18 @@ export const subjectsApi = {
     api.post<{ subject: Subject }>(`/api/subjects/${id}/archive`, { archived }),
   remove: (id: string) => api.del<void>(`/api/subjects/${id}`),
   state: (id: string) => api.get<SubjectStateView>(`/api/subjects/${id}/state`),
-  weakPoints: (id: string) => api.get<{ items: WeakPoint[] }>(`/api/subjects/${id}/weak-points`),
+  weakPoints: (id: string) => api.get<{ items: WeakPointWithNode[] }>(`/api/subjects/${id}/weak-points`),
+  review: (id: string) => api.get<ReviewOverview>(`/api/subjects/${id}/review`),
+  startReview: (id: string, nodeId: string) =>
+    api.post<ReviewTurn>(`/api/subjects/${id}/review/start`, { node_id: nodeId }),
+  answerReview: (id: string, question: string) =>
+    api.post<ReviewTurn>(`/api/subjects/${id}/review/answer`, { question }),
+  nodeHistory: (id: string, nodeId: string) =>
+    api.get<NodeHistory>(`/api/subjects/${id}/nodes/${nodeId}/history`),
+  saveNote: (id: string, nodeId: string, content: string) =>
+    api.put<{ note: StudyNote }>(`/api/subjects/${id}/nodes/${nodeId}/note`, { content }),
+  archiveOverview: (id: string) => api.get<ArchiveView>(`/api/subjects/${id}/archive`),
+  completionReport: (id: string) => api.get<CompletionReport>(`/api/subjects/${id}/report`),
   assessment: (id: string) => api.get<AssessmentView>(`/api/subjects/${id}/assessment`),
   path: (id: string) => api.get<PathView>(`/api/subjects/${id}/path`),
   confirmPath: (id: string) => api.post<{ state: string }>(`/api/subjects/${id}/path/confirm`),

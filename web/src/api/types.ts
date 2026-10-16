@@ -116,6 +116,7 @@ export interface Assessment {
 export interface AnswerRecord {
   id: number
   node_id: string
+  source: 'teach' | 'review'
   question: string
   answer: string
   verdict: Verdict
@@ -134,6 +135,100 @@ export interface WeakPoint {
   fail_count: number
   last_attempt_at: string | null
   resolved: boolean
+}
+
+export interface ReviewItem extends WeakPointWithNode {}
+
+export interface ReviewTurn {
+  text: string
+  phase: 'question' | 'passed' | 'failed'
+  mode: 'weak' | 'adjacent'
+  node: KnowledgeNode | null
+  verdict: Verdict | null
+  confidence: number
+  feedback: string
+  hit_points: string[]
+  missing_points: string[]
+  promoted: boolean
+  resolved: boolean
+  fail_count: number
+  suggestion: string
+  node_index: number
+  node_total: number
+}
+
+export interface ReviewOverview {
+  items: ReviewItem[]
+  open_count: number
+  node_total: number
+  mastered_count: number
+  current: ReviewTurn | null
+}
+
+export interface NodeHistory {
+  node_id: string
+  items: AnswerRecord[]
+  teach_count: number
+  review_count: number
+}
+
+/** 节点笔记（FR-801）：`auto` 是模型自动小结，`user` 是手写覆盖。 */
+export interface StudyNote {
+  id: string
+  node_id: string
+  content: string
+  source: 'auto' | 'user'
+  updated_at: string | null
+}
+
+/** 薄弱点条目带上所属节点信息，便于在档案/复习页直接展示位置。 */
+export interface WeakPointWithNode extends WeakPoint {
+  node_title: string
+  node_index?: number
+  node_total?: number
+}
+
+export interface ArchiveNode extends KnowledgeNode {
+  answer_count: number
+  review_count: number
+  note: StudyNote | null
+}
+
+export interface ArchiveView {
+  subject: Subject
+  path_id: string | null
+  path_version: number | null
+  nodes: ArchiveNode[]
+  progress: Progress
+  weak_points: WeakPointWithNode[]
+}
+
+export interface ReportEntry {
+  id: string
+  index: number
+  title: string
+  /** 仅「部分掌握」会带：是哪些原因让它停在这里（FR-417）。 */
+  reasons?: string[]
+}
+
+export interface CompletionReport {
+  subject: Subject
+  state: SubjectState
+  mastered: ReportEntry[]
+  partial: ReportEntry[]
+  skipped: ReportEntry[]
+  weak_points: WeakPointWithNode[]
+  usage: {
+    calls: number
+    total_tokens: number
+    reasoning_tokens: number
+    cached_prompt_tokens: number
+    cache_hit_rate: number
+    /** 累计模型调用耗时（毫秒），不含用户阅读时间（FR-417）。 */
+    duration_ms: number
+  }
+  started_at: string | null
+  last_activity_at: string | null
 }
 
 /** `GET /subjects/{id}/state`：刷新后唯一的恢复入口。 */
@@ -178,6 +273,31 @@ export interface TeachingView {
   last_action: string | null
 }
 
+// --------------------------------------------------------------------------- //
+// 按用途的模型策略（FR-703）
+// --------------------------------------------------------------------------- //
+
+/** 可单独配置的调用用途（与后端 `LlmPurpose` 一一对应）。 */
+export type LlmPurposeKey = 'assess' | 'plan' | 'teach' | 'judge' | 'compress'
+
+export type ModelPick = 'inherit' | 'default' | 'pro'
+export type ThinkingPick = 'inherit' | 'on' | 'off'
+export type EffortPick = 'inherit' | 'low' | 'high' | 'max'
+
+/** 单个用途的覆盖项；每一项都可以"继承全局设置"。 */
+export interface PurposeOverride {
+  model: ModelPick
+  thinking: ThinkingPick
+  reasoning_effort: EffortPick
+}
+
+/** 解析后的实际参数（只读展示，告诉用户"这一项真的会用什么"）。 */
+export interface ModelChoice {
+  model: string
+  thinking: boolean
+  reasoning_effort: string
+}
+
 export interface Settings {
   base_url: string
   model_default: string
@@ -187,6 +307,16 @@ export interface Settings {
   max_tokens: number
   timeout_seconds: number
   max_retries: number
+  /** 采样温度（FR-718）：思考模式下官方会忽略它。 */
+  temperature: number
+  /** 核采样（FR-718）：仅思考模式下生效，且被钳制到 0.95~1.0。 */
+  top_p: number
+  /** 请求审计开关（FR-715）：开启后记录完整请求与响应，默认关闭。 */
+  audit_enabled: boolean
+  use_recommended_overrides: boolean
+  purpose_overrides: Partial<Record<LlmPurposeKey, PurposeOverride>>
+  /** 每个用途解析后的实际参数；只读，提交时忽略。 */
+  model_plan?: Record<LlmPurposeKey, ModelChoice>
   assess_max_turns: number
   path_min_nodes: number
   path_max_nodes: number
@@ -209,15 +339,35 @@ export interface ModelInfo {
   default_effort: string
 }
 
-export interface UsageSummary {
+/** 用量聚合的一格（全局、某用途或某主题）。 */
+export interface UsageBucket {
   calls: number
   prompt_tokens: number
   cached_prompt_tokens: number
-  cache_miss_tokens: number
   completion_tokens: number
   reasoning_tokens: number
   total_tokens: number
   cache_hit_rate: number
+  duration_ms: number
+}
+
+export interface SubjectUsageBucket {
+  subject_id: string
+  title: string
+  calls: number
+  total_tokens: number
+  cache_hit_rate: number
+  duration_ms: number
+}
+
+export interface UsageSummary extends UsageBucket {
+  cache_miss_tokens: number
+  /** 按用途的用量（FR-705）；后端未提供时前端按空表展示。 */
+  by_purpose?: Record<string, UsageBucket>
+  /** 按主题的用量（取 token 前若干名）。 */
+  by_subject?: SubjectUsageBucket[]
+  /** 命中率异常时的排查提示；正常时为 null（FR-705、FR-720）。 */
+  cache_hint?: string | null
 }
 
 export interface Health {

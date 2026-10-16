@@ -1,11 +1,13 @@
 ﻿import { useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { errorMessage } from '../api/client'
-import { subjectsApi, streamPaths } from '../api/endpoints'
+import { settingsApi, subjectsApi, streamPaths } from '../api/endpoints'
 import type { AnswerRecord, HintPayload, NodeDecision, OptionsPayload, SseEvent, VerdictPayload } from '../api/types'
 import { Banner, Spinner, VerdictCard } from '../components/Banner'
 import { AssistantText, Conversation, StreamingBubble, UserBubble } from '../components/Conversation'
 import { Markdown } from '../components/Markdown'
+import { NodeHistoryPanel } from '../components/NodeHistoryPanel'
 import { NodeStateBadge } from '../components/StatusBadge'
 import { useResource } from '../hooks/useResource'
 import { useTurnStream } from '../hooks/useTurnStream'
@@ -26,7 +28,15 @@ const CHOICE_LABELS: Record<NodeDecision, string> = {
 const EMPTY_ANSWERS: AnswerRecord[] = []
 
 /** 路径侧栏：节点目录 + 状态 + 当前节点高亮 + 整体进度（P6 布局的左栏）。 */
-function PathSidebar({ currentNodeId }: { currentNodeId: string | null }) {
+function PathSidebar({
+  currentNodeId,
+  historyNodeId,
+  onSelectHistory,
+}: {
+  currentNodeId: string | null
+  historyNodeId: string | null
+  onSelectHistory: (nodeId: string) => void
+}) {
   const { state } = useSubject()
   const nodes = state.path?.nodes ?? []
   const mastered = nodes.filter((node) => node.state === 'mastered').length
@@ -45,9 +55,16 @@ function PathSidebar({ currentNodeId }: { currentNodeId: string | null }) {
         {nodes.map((node) => (
           <li key={node.id} className={`node-item${node.id === currentNodeId ? ' current' : ''}`}>
             <div className="node-item-head">
-              <span className="small">
+              {/* 点标题看这个节点的历史：用户实测提出的缺口——学过的东西要找回来，只能靠记忆里翻 */}
+              <button
+                type="button"
+                className="node-button small"
+                aria-pressed={node.id === historyNodeId}
+                title="查看这个节点的历史对话"
+                onClick={() => onSelectHistory(node.id)}
+              >
                 {node.index}. {node.title}
-              </span>
+              </button>
             </div>
             <NodeStateBadge state={node.state} />
             {node.attempts > 0 ? <span className="muted small"> 尝试 {node.attempts} 次</span> : null}
@@ -116,8 +133,12 @@ export function TeachingPage() {
   const [question, setQuestion] = useState('')
   const [asking, setAsking] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [historyNodeId, setHistoryNodeId] = useState<string | null>(null)
 
   const { data, error, reload } = useResource(() => subjectsApi.teaching(subjectId), [subjectId])
+  // 思维链是否展示由设置决定（FR-713）：写死成 true 会让"关闭展示"这个开关形同虚设
+  const settings = useResource(() => settingsApi.get(), [])
+  const showReasoning = settings.data?.settings.show_reasoning ?? false
 
   const session = data?.session ?? state.session
   const node = data?.node ?? state.node
@@ -252,12 +273,36 @@ export function TeachingPage() {
 
   return (
     <div className="workspace">
-      <PathSidebar currentNodeId={node?.id ?? null} />
+      <PathSidebar
+        currentNodeId={node?.id ?? null}
+        historyNodeId={historyNodeId}
+        onSelectHistory={(nodeId) => setHistoryNodeId((current) => (current === nodeId ? null : nodeId))}
+      />
 
       <div className="stack">
         {error ? <Banner onRetry={reload}>{error}</Banner> : null}
         {domainError ? <Banner>{domainError}</Banner> : null}
         {stream.httpError ? <Banner>{stream.httpError}</Banner> : null}
+
+        {historyNodeId !== null ? (
+          <section className="card stack" aria-label="节点历史">
+            <div className="row-between">
+              <h2>
+                节点历史：
+                {(state.path?.nodes ?? []).find((item) => item.id === historyNodeId)?.title ?? '（节点已不存在）'}
+              </h2>
+              <div className="btn-row">
+                <Link className="btn btn-sm" to={`/subjects/${subjectId}/archive`}>
+                  在档案里查看
+                </Link>
+                <button type="button" className="btn btn-sm" onClick={() => setHistoryNodeId(null)}>
+                  关闭
+                </button>
+              </div>
+            </div>
+            <NodeHistoryPanel subjectId={subjectId} nodeId={historyNodeId} />
+          </section>
+        ) : null}
         {paused ? (
           <Banner tone="notice">
             学习已暂停，作答通道已关闭。
@@ -365,7 +410,7 @@ export function TeachingPage() {
                 reasoning={stream.reasoning}
                 streaming={stream.streaming}
                 stopped={stream.stopped}
-                showReasoning={true}
+                showReasoning={showReasoning}
               />
             ) : null}
           </Conversation>
