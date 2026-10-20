@@ -5,7 +5,8 @@
 - 需求规格：[docs/需求规格说明书.md](docs/需求规格说明书.md)
 - 实施计划（当前现状与剩余规划）：[docs/实施计划.md](docs/实施计划.md)
 - 实施记录（各阶段历史与交付证据）：[docs/实施记录.md](docs/实施记录.md)
-- 接口契约：[docs/接口契约.md](docs/接口契约.md)
+- 接口契约（当前有效）：[docs/接口契约.md](docs/接口契约.md)
+- 契约变更记录（版本演进与实测结论）：[docs/接口契约变更记录.md](docs/接口契约变更记录.md)
 - Spike 实测：[docs/Spike实测结果.md](docs/Spike实测结果.md)
 - 设计参考：[ReferenceCode/](ReferenceCode)（C# 实现，仅作参考，不作依赖）
 
