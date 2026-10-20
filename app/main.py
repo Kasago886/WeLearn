@@ -9,9 +9,11 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-from app.api import health, settings, subjects
+from app.api import billing, exports, health, ops, search, settings, subjects
+from app.infra.access import token_matches
 from app.main_context import AppContext, build_context
 from app.services.learning.stack import build_learning_stack
 
@@ -40,8 +42,33 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     app.state.ctx = context
     app.state.stack = stack
     app.include_router(health.router)
+    app.include_router(ops.router)
+    app.include_router(billing.router)
+    app.include_router(exports.router)
+    app.include_router(search.router)
     app.include_router(subjects.router)
     app.include_router(settings.router)
+
+    @app.middleware("http")
+    async def guard_access_token(request: Request, call_next):  # type: ignore[no-untyped-def]
+        """可选访问口令（FR-903）。
+
+        **每个请求现读设置**，而不是在启动时决定是否启用：口令可能在运行中被设置或清除，
+        缓存下来就会出现"设置了口令却仍能匿名访问"这种最不该出现的窗口。
+
+        跳过健康检查与口令探针：前者不含任何学习数据、且是"服务起没起来"的唯一入口；
+        后者需要能被调用来判断"是我的口令错了，还是服务没开"。
+        """
+        ctx: AppContext = request.app.state.ctx
+        stored = ctx.settings.access_token_hash
+        path = request.url.path
+        exempt = path == "/api/health" or path == "/api/auth/verify" or not path.startswith("/api")
+        if stored and not exempt and request.method != "OPTIONS":
+            token = request.headers.get("x-access-token") or request.cookies.get("access_token")
+            if not token_matches(token, stored):
+                return JSONResponse(status_code=401, content={"detail": "需要访问口令：请先在设置页填入口令。"})
+        return await call_next(request)
+
     return app
 
 

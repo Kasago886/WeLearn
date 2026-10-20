@@ -95,6 +95,16 @@ V6_SETTINGS_COLUMNS = (
     "purpose_overrides_json",
 )
 
+V7_SETTINGS_COLUMNS = (
+    "review_interval_days",
+    "log_max_mb",
+    "log_retention_days",
+    "access_token_hash",
+    "tools_enabled",
+)
+
+V7_NODE_COLUMNS = ("review_box", "review_due_at")
+
 
 def make_old_database(path: Path) -> Database:
     """构造一个"v2 时代"的库：session_state 存在但缺 awaiting_decision。"""
@@ -227,8 +237,46 @@ def test_v6_settings_columns_are_added_and_keep_existing_rows(tmp_path: Path) ->
 def test_v6_columns_exist_on_fresh_database(tmp_path: Path) -> None:
     db = Database.from_path(tmp_path / "fresh.db")
     try:
-        assert db.init() == 6
+        assert db.init() == 7
         assert set(V6_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
+    finally:
+        db.dispose()
+
+
+def test_v7_columns_exist_on_fresh_database(tmp_path: Path) -> None:
+    """v7：复习排期、日志保留、访问口令与工具开关。"""
+    db = Database.from_path(tmp_path / "fresh.db")
+    try:
+        assert db.init() == 7
+        assert set(V7_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
+        assert set(V7_NODE_COLUMNS) <= column_names(db, "knowledge_point")
+    finally:
+        db.dispose()
+
+
+def test_v7_upgrades_old_settings_row(tmp_path: Path) -> None:
+    """老库补列后读取走默认值：不能因为缺列把整份设置读崩（FR-902）。"""
+    db = Database.from_path(tmp_path / "old.db")
+    try:
+        db.init()
+        with db.engine.begin() as connection:
+            for column in V7_SETTINGS_COLUMNS:
+                # app_settings 上没有索引，可以直接 DROP COLUMN 造出"老库"
+                connection.execute(text(f"ALTER TABLE app_settings DROP COLUMN {column}"))
+
+        for column in V7_SETTINGS_COLUMNS:
+            assert column not in column_names(db, "app_settings")
+
+        assert db.init() == 7
+        assert set(V7_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
+
+        service = SettingsService(db, {"WELEARN_DATA_DIR": str(tmp_path)})
+        settings = service.load()
+        assert settings.review_interval_days == 7
+        assert settings.log_max_mb == 5
+        assert settings.log_retention_days == 14
+        assert settings.access_token_hash == ""
+        assert settings.tools_enabled is False
     finally:
         db.dispose()
 

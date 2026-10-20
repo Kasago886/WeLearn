@@ -10,9 +10,11 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import get_context, get_stack
 from app.contracts.schemas import LlmPurpose
+from app.infra.access import hash_token
 from app.infra.settings import AppSettings, PurposeOverride, purpose_overrides_payload
 from app.main_context import AppContext
 from app.services.learning.stack import LearningStack
+from app.services.llm.cost import effective_price_table
 from app.services.llm.policy import ModelPolicy, describe_model_plan
 from app.services.llm.usage import UsageSummary
 
@@ -45,6 +47,16 @@ class SettingsRequest(BaseModel):
     audit_enabled: bool = False
     use_recommended_overrides: bool = False
     purpose_overrides: dict[LlmPurpose, PurposeOverride] = Field(default_factory=dict)
+    # P4：复习排期阈值、日志轮转与保留、工具调用
+    review_interval_days: int = Field(default=7, ge=1, le=365)
+    log_max_mb: int = Field(default=5, ge=1, le=100)
+    log_retention_days: int = Field(default=14, ge=1, le=365)
+    tools_enabled: bool = False
+    # 单价表（FR-706）：逐模型覆盖，留空则使用内置默认价目；单位「元 / 百万 token」
+    price_table: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # 访问口令（FR-903）：None = 保持现状，"" = 清除，非空 = 设为新口令。
+    # 用三态而不是布尔，是为了让"只想改别的设置"的请求不会顺手把口令清掉。
+    access_token: str | None = Field(default=None, max_length=200)
 
 
 class ApiKeyRequest(BaseModel):
@@ -78,6 +90,15 @@ def _settings_payload(settings: AppSettings, ctx: AppContext, policy: ModelPolic
         "top_p": settings.top_p,
         "audit_enabled": settings.audit_enabled,
         "use_recommended_overrides": settings.use_recommended_overrides,
+        "review_interval_days": settings.review_interval_days,
+        "log_max_mb": settings.log_max_mb,
+        "log_retention_days": settings.log_retention_days,
+        "tools_enabled": settings.tools_enabled,
+        # 单价表回的是**生效值**（内置默认 + 用户覆盖），否则界面上一片空白，
+        # 用户没法判断"这次估算到底按什么价在算"（FR-706）
+        "price_table": effective_price_table(settings.price_table),
+        # 口令只报告"是否已设置"，本身永不回传（FR-903、FR-708 同一原则）
+        "access_token_enabled": bool(settings.access_token_hash),
         # 按用途覆盖：五个用途全部补齐，"继承"显式写出来，前端不必自己补默认值（FR-703）
         "purpose_overrides": purpose_overrides_payload(settings),
         # 只读：每个用途**实际**会用的参数。覆盖项写进去不等于生效（可能被推荐项或"继承"
@@ -111,11 +132,15 @@ def put_settings(
     from pydantic import ValidationError
 
     current = ctx.settings
+    values = payload.model_dump()
+    token = values.pop("access_token", None)
+    # 三态口令：None 保持现状、"" 清除、非空设为新口令（只存哈希）
+    token_hash = current.access_token_hash if token is None else hash_token(token)
     try:
         candidate = AppSettings(
-            **payload.model_dump(),
+            **values,
             data_dir=current.data_dir,
-            price_table=current.price_table,
+            access_token_hash=token_hash,
         )
     except ValidationError as exc:
         from fastapi import HTTPException, status
@@ -198,6 +223,17 @@ def _summary_payload(summary: UsageSummary) -> dict[str, Any]:
     }
 
 
+def _cost_payload(cost: Any) -> dict[str, Any]:
+    """费用估算的对外形状（FR-706）。金额保留 6 位：单次调用常常只有几分钱。"""
+    return {
+        "amount": round(cost.amount, 6),
+        "currency": cost.currency,
+        "peak_tokens": cost.peak_tokens,
+        "off_peak_tokens": cost.off_peak_tokens,
+        "total_tokens": cost.total_tokens,
+    }
+
+
 @router.get("/usage")
 def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
     """全局用量、按用途/按主题聚合与缓存命中提示（FR-705）。
@@ -208,6 +244,7 @@ def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
 
     recorder = UsageRecorder(ctx.db)
     summary = recorder.summary()
+    cost = recorder.cost_summary(price_table=ctx.settings.price_table)
     return {
         "calls": summary.calls,
         "prompt_tokens": summary.prompt_tokens,
@@ -217,6 +254,9 @@ def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
         "reasoning_tokens": summary.reasoning_tokens,
         "total_tokens": summary.total_tokens,
         "cache_hit_rate": round(summary.cache_hit_rate, 4),
+        "duration_ms": summary.duration_ms,
+        # 逐行按"那条记录发生的时刻"结算高峰/空闲价，而不是拿当前时刻一刀切（FR-706）
+        "cost": _cost_payload(cost),
         "by_purpose": {purpose: _summary_payload(item) for purpose, item in recorder.by_purpose().items()},
         "by_subject": [
             {

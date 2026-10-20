@@ -171,7 +171,14 @@ def list_subjects(
 
     # FR-107：同名主题允许存在，但列表里要能看出来
     titles = Counter(payload["title"] for payload in payloads)
-    for payload in payloads:
+    # FR-505：到期/久未复习的计数一次查回来，避免主题多了以后每个主题一条 SQL
+    review_stats = stack.repos.subjects.review_stats(
+        interval_days=stack.settings_provider().review_interval_days,
+    )
+    for item, payload in zip(items, payloads, strict=True):
+        stat = review_stats.get(item.subject.id)
+        payload["due_reviews"] = stat.due_reviews if stat is not None else 0
+        payload["needs_review"] = stat.needs_review if stat is not None else False
         payload["duplicate_title_hint"] = titles[payload["title"]] > 1
 
     return {"items": payloads}
@@ -302,11 +309,13 @@ def list_weak_points(subject_id: str, stack: LearningStack = Depends(get_stack))
         ],
         "node_total": overview.node_total,
         "mastered_count": overview.mastered_count,
+        # 已有字段一个不动，只补上到期数（FR-506），老前端不受影响
+        "due_count": overview.due_count,
     }
 
 
 # --------------------------------------------------------------------------- #
-# 复习（FR-502~FR-504、FR-507）
+# 复习（FR-502~FR-507）
 # --------------------------------------------------------------------------- #
 
 
@@ -340,7 +349,7 @@ def _review_call(action: Callable[[], Any]) -> dict[str, Any]:
 
 @router.get("/{subject_id}/review")
 def review_overview(subject_id: str, stack: LearningStack = Depends(get_stack)) -> dict[str, Any]:
-    """薄弱点清单 + 进度（FR-502、FR-804）。"""
+    """薄弱点清单 + 到期复习 + 进度（FR-502、FR-506、FR-804）。"""
     require_subject(stack, subject_id)
     overview = stack.reviews.overview(subject_id)
     return {
@@ -356,6 +365,18 @@ def review_overview(subject_id: str, stack: LearningStack = Depends(get_stack)) 
         "open_count": overview.open_count,
         "node_total": overview.node_total,
         "mastered_count": overview.mastered_count,
+        "due": [
+            {
+                "node_id": item.node.id,
+                "node_title": item.node_title,
+                "node_index": item.node_index,
+                "node_total": item.node_total,
+                "due_at": iso(item.due_at),
+                "interval_days": item.interval_days,
+            }
+            for item in overview.due
+        ],
+        "due_count": overview.due_count,
         "current": (
             _review_turn_payload(current)
             if (current := stack.reviews.current(subject_id)) is not None
@@ -505,6 +526,10 @@ def completion_report(subject_id: str, stack: LearningStack = Depends(get_stack)
 
     usage = stack.usage
     summary = usage.summary(subject_id=subject_id)
+    cost = usage.cost_summary(
+        subject_id=subject_id,
+        price_table=stack.settings_provider().price_table,
+    )
     overview = stack.reviews.overview(subject_id)
     return {
         "subject": subject_payload(subject),
@@ -524,6 +549,14 @@ def completion_report(subject_id: str, stack: LearningStack = Depends(get_stack)
             "cache_hit_rate": summary.cache_hit_rate,
             # 累计模型调用耗时（FR-417）。这是"生成花了多久"，不含用户阅读时间。
             "duration_ms": summary.duration_ms,
+            # 本主题的费用估算（FR-706）：逐条按发生时刻取高峰/空闲价
+            "cost": {
+                "amount": round(cost.amount, 6),
+                "currency": cost.currency,
+                "peak_tokens": cost.peak_tokens,
+                "off_peak_tokens": cost.off_peak_tokens,
+                "total_tokens": cost.total_tokens,
+            },
         },
         # 学习跨度：从建主题到最后一次活动。与上面的"累计耗时"是两个不同的量，
         # 各有各的用处，所以分开给，不合并成一个含义模糊的"耗时"。

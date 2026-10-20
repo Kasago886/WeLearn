@@ -87,7 +87,7 @@ class AppSettings(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     # 生效值，只读（见模块文档）
     data_dir: str = DEFAULT_DATA_DIR
-    price_table: dict[str, float] = Field(default_factory=dict)
+    price_table: dict[str, dict[str, float]] = Field(default_factory=dict)
     # 采样参数（FR-718）。默认值与官方默认一致：不显式配置时不改变模型行为。
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, ge=0.01, le=1.0)
@@ -96,6 +96,15 @@ class AppSettings(BaseModel):
     # 按用途的模型与思考档位（FR-703）
     use_recommended_overrides: bool = False
     purpose_overrides: dict[LlmPurpose, PurposeOverride] = Field(default_factory=dict)
+    # 久未复习的提醒阈值（FR-505）：已掌握节点超过这么多天没触达就标记"建议复习"
+    review_interval_days: int = Field(default=7, ge=1, le=365)
+    # 日志轮转与保留（FR-907）
+    log_max_mb: int = Field(default=5, ge=1, le=100)
+    log_retention_days: int = Field(default=14, ge=1, le=365)
+    # 可选访问口令（FR-903）。只存哈希，空串表示"不设口令"。
+    access_token_hash: str = ""
+    # 工具调用（FR-714）。默认关闭：开启后历史思维链必须回传（FR-719），上下文会明显变贵
+    tools_enabled: bool = False
 
     def paths_inverted(self) -> bool:
         """路径节点数区间是否颠倒。"""
@@ -256,6 +265,11 @@ class SettingsService:
             row.audit_enabled = to_store.audit_enabled
             row.use_recommended_overrides = to_store.use_recommended_overrides
             row.purpose_overrides_json = _purpose_overrides_json(to_store)
+            row.review_interval_days = to_store.review_interval_days
+            row.log_max_mb = to_store.log_max_mb
+            row.log_retention_days = to_store.log_retention_days
+            row.access_token_hash = to_store.access_token_hash
+            row.tools_enabled = to_store.tools_enabled
             session.add(row)
 
         self._log.info("设置已保存")
@@ -297,6 +311,11 @@ class SettingsService:
                 "audit_enabled": row.audit_enabled,
                 "use_recommended_overrides": row.use_recommended_overrides,
                 "purpose_overrides": row.purpose_overrides_json,
+                "review_interval_days": row.review_interval_days,
+                "log_max_mb": row.log_max_mb,
+                "log_retention_days": row.log_retention_days,
+                "access_token_hash": row.access_token_hash,
+                "tools_enabled": row.tools_enabled,
             }
 
     def _apply_env(self, settings: AppSettings) -> tuple[AppSettings, list[str]]:

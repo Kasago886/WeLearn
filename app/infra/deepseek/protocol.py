@@ -15,7 +15,15 @@
   因此界面必须标注"当前配置下该参数不生效或已被钳制"，否则用户会误以为调参无效是 bug；
 - `presence_penalty` / `frequency_penalty` **本项目不使用**，一律不下发。
 
-另有两条官方限制由上层负责（FR-714）：思考模式下不支持 `tool_choice=required` 与指定具体 tool。
+工具调用（FR-714）在这两层处理：
+
+- **请求侧**：给了非空 `tools` 才下发 `tools`，**永远不下发 `tool_choice`**。
+  原因是官方限制——思考模式下 `tool_choice="required"` 与"指定具体某个工具"都会返回 400，
+  而本项目的教学调用可能就处在思考模式，写死 `tool_choice` 等于让一条正常请求随机 400；
+  不下发时默认值是 `auto`，模型自己决定是否调用，这恰好也是我们要的语义。
+- **响应侧**：流式按 `index` 累积 `delta.tool_calls`（`id` / `name` 只取首个非空块，
+  `arguments` 逐块拼接），非流式直接读 `message.tool_calls`，两者都归一成
+  :class:`ToolCall`，上层因此不必区分两种传输方式。
 """
 
 from collections.abc import Mapping, Sequence
@@ -94,20 +102,49 @@ class TokenUsage:
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    """模型请求的一次工具调用（FR-714）。
+
+    ``arguments`` 保留**原始 JSON 字符串**：官方返回的就是"未解析的字符串"，
+    在协议层解析会把"模型给了非法 JSON"变成"协议解析失败"，而那种情况应该作为
+    工具结果回给模型让它自己纠正，不是让整轮失败。
+    """
+
+    id: str
+    name: str
+    arguments: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        """还原成放回 history 的 `assistant.tool_calls[]` 元素。"""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+@dataclass(frozen=True)
 class StreamEvent:
     """流式事件。
 
     - 增量事件：`content` 与/或 `reasoning` 有值，`usage` 为 None；
-    - 收尾事件：`content` 与 `reasoning` 均为 None，`usage` 有值。
+    - 工具调用事件：`tool_calls` 有值（流结束时一次性给出累积结果）；
+    - 收尾事件：`content` / `reasoning` / `tool_calls` 均为 None，`usage` 有值。
     """
 
     content: str | None = None
     reasoning: str | None = None
     usage: TokenUsage | None = None
+    tool_calls: tuple[ToolCall, ...] | None = None
 
     @property
     def is_usage_only(self) -> bool:
-        return self.content is None and self.reasoning is None and self.usage is not None
+        return (
+            self.content is None
+            and self.reasoning is None
+            and self.tool_calls is None
+            and self.usage is not None
+        )
 
 
 def build_chat_request(
@@ -149,6 +186,7 @@ def build_chat_request(
         body["response_format"] = {"type": "json_object"}
 
     if tools:
+        # 只下发 tools，**不下发 tool_choice**（见模块文档：思考模式下 required/指定工具会 400）
         body["tools"] = list(tools)
 
     return body
@@ -182,6 +220,99 @@ def extract_usage(chunk: Mapping[str, Any]) -> TokenUsage | None:
     return TokenUsage.from_usage_dict(usage if isinstance(usage, Mapping) else None)
 
 
+def _first_delta(chunk: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    choices = chunk.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return None
+    delta = first.get("delta")
+    return delta if isinstance(delta, Mapping) else None
+
+
+def extract_tool_call_deltas(chunk: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """取出一个数据块里的 `delta.tool_calls` 增量项（可能为空）。"""
+    delta = _first_delta(chunk)
+    if delta is None:
+        return []
+    raw = delta.get("tool_calls")
+    if not isinstance(raw, Sequence) or isinstance(raw, str):
+        return []
+    return [item for item in raw if isinstance(item, Mapping)]
+
+
+class ToolCallAccumulator:
+    """按 `index` 累积流式工具调用。
+
+    官方把一次调用拆成若干块：首块带 `id` 与 `name`，后续块只带 `arguments` 片段。
+    因此 `id` / `name` **只取首个非空值**（后续块可能是空串或重复值），`arguments` 逐块拼接。
+    """
+
+    def __init__(self) -> None:
+        self._parts: dict[int, dict[str, str]] = {}
+
+    def feed(self, chunk: Mapping[str, Any]) -> bool:
+        """累积一个数据块；返回该块是否含有工具调用增量。"""
+        deltas = extract_tool_call_deltas(chunk)
+        for position, raw in enumerate(deltas):
+            index = raw.get("index")
+            key = index if isinstance(index, int) else position
+            entry = self._parts.setdefault(key, {"id": "", "name": "", "arguments": ""})
+
+            call_id = raw.get("id")
+            if isinstance(call_id, str) and call_id and not entry["id"]:
+                entry["id"] = call_id
+
+            function = raw.get("function")
+            if isinstance(function, Mapping):
+                name = function.get("name")
+                if isinstance(name, str) and name and not entry["name"]:
+                    entry["name"] = name
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    entry["arguments"] += arguments
+        return bool(deltas)
+
+    def finish(self) -> tuple[ToolCall, ...]:
+        """产出累积结果；缺 `name` 的块无法执行，直接丢弃。"""
+        calls: list[ToolCall] = []
+        for key in sorted(self._parts):
+            entry = self._parts[key]
+            if not entry["name"]:
+                continue
+            calls.append(ToolCall(id=entry["id"], name=entry["name"], arguments=entry["arguments"]))
+        return tuple(calls)
+
+
+def parse_tool_calls(message: Mapping[str, Any]) -> tuple[ToolCall, ...]:
+    """解析非流式响应里的 `message.tool_calls`。"""
+    raw = message.get("tool_calls")
+    if not isinstance(raw, Sequence) or isinstance(raw, str):
+        return ()
+
+    calls: list[ToolCall] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        function = item.get("function")
+        if not isinstance(function, Mapping):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        arguments = function.get("arguments")
+        call_id = item.get("id")
+        calls.append(
+            ToolCall(
+                id=call_id if isinstance(call_id, str) else "",
+                name=name,
+                arguments=arguments if isinstance(arguments, str) else "",
+            )
+        )
+    return tuple(calls)
+
+
 @dataclass(frozen=True)
 class BlockingResult:
     """非流式响应。"""
@@ -189,6 +320,7 @@ class BlockingResult:
     content: str
     reasoning: str | None
     usage: TokenUsage | None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 def parse_blocking_response(body: Mapping[str, Any]) -> BlockingResult:
@@ -210,7 +342,12 @@ def parse_blocking_response(body: Mapping[str, Any]) -> BlockingResult:
     reasoning = raw_reasoning if isinstance(raw_reasoning, str) and raw_reasoning else None
 
     usage = TokenUsage.from_usage_dict(body.get("usage") if isinstance(body.get("usage"), Mapping) else None)
-    return BlockingResult(content=content, reasoning=reasoning, usage=usage)
+    return BlockingResult(
+        content=content,
+        reasoning=reasoning,
+        usage=usage,
+        tool_calls=parse_tool_calls(message),
+    )
 
 
 @dataclass(frozen=True)

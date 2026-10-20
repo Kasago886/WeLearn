@@ -65,6 +65,13 @@ class AppSettingsRow(Base):
     use_recommended_overrides: Mapped[bool | None] = mapped_column(Boolean)
     # 以 JSON 文本存：覆盖项形状随用途增加而扩展，加列不如加字段（与 price_table 同一取舍）
     purpose_overrides_json: Mapped[str | None] = mapped_column(Text)
+    # v7：复习排期阈值（FR-505）、日志轮转与保留（FR-907）、访问口令（FR-903）、工具调用（FR-714）
+    review_interval_days: Mapped[int | None] = mapped_column(Integer)
+    log_max_mb: Mapped[int | None] = mapped_column(Integer)
+    log_retention_days: Mapped[int | None] = mapped_column(Integer)
+    # 只存哈希：口令是"能不能看数据"的凭据，没有必要在库里留明文（与 API Key 同一原则）
+    access_token_hash: Mapped[str | None] = mapped_column(String(64))
+    tools_enabled: Mapped[bool | None] = mapped_column(Boolean)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -272,6 +279,11 @@ class KnowledgePointRow(Base):
     mastered_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
     summary_note: Mapped[str | None] = mapped_column(Text)
+    # v7 间隔复习排期（FR-506）：Leitner 箱号决定下次间隔；到期时间单独存，
+    # 而不是每次读取时用"最近修改时间 + 间隔"现算——现算会让复习通过的记录
+    # 在节点被编辑（如改标题）后凭空改变到期日。
+    review_box: Mapped[int | None] = mapped_column(Integer, default=0)
+    review_due_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
 
     __table_args__ = (Index("ix_knowledge_point_path_order", "path_id", "order_index"),)
 

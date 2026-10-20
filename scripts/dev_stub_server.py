@@ -30,7 +30,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import BlockingResult, StreamEvent, TokenUsage
+from app.infra.deepseek.protocol import BlockingResult, StreamEvent, ToolCall, TokenUsage
 from app.main import create_app
 from app.services.learning.stack import build_learning_stack
 
@@ -168,6 +168,8 @@ class StubClient:
         self.stream_calls = 0
         self.blocking_calls = 0
         self._last_answer = ""
+        # 只演示一次工具调用：第二轮（带工具结果）必须回到正常正文，否则会无限循环
+        self._tool_used = False
 
     async def aclose(self) -> None:
         return None
@@ -218,11 +220,22 @@ class StubClient:
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         del model, thinking, reasoning_effort, max_tokens, json_object, timeout_seconds
         self.stream_calls += 1
         route = self._route(messages, purpose)
         self._last_answer = self._last_user_text(messages)
+
+        # 演示工具调用（FR-714）：只在"第一次带 tools 的教学请求"上触发，
+        # 这样前端能看到"查档案 → 再讲解"的完整流程，又不会无限循环
+        if tools and not self._tool_used:
+            self._tool_used = True
+            yield StreamEvent(tool_calls=(ToolCall(id="stub-call-1", name="read_archive", arguments="{}"),))
+            yield StreamEvent(
+                usage=TokenUsage(prompt_tokens=80, cached_prompt_tokens=0, cache_miss_tokens=80, completion_tokens=10)
+            )
+            return
 
         text = {
             "explain": EXPLANATION,
@@ -254,8 +267,9 @@ class StubClient:
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> BlockingResult:
-        del model, thinking, reasoning_effort, max_tokens, json_object, timeout_seconds
+        del model, thinking, reasoning_effort, max_tokens, json_object, timeout_seconds, tools
         self.blocking_calls += 1
         route = self._route(messages, purpose)
         answer = _extract_answer(self._system_text(messages), self._last_user_text(messages))
@@ -282,6 +296,21 @@ class StubClient:
 
     async def list_models(self) -> list[Any]:
         return []
+
+    async def get_balance(self, *, timeout_seconds: int | None = None) -> Mapping[str, Any]:
+        """桩服务的余额（FR-710）：字段形状与官方一致，金额保持字符串。"""
+        del timeout_seconds
+        return {
+            "is_available": True,
+            "balance_infos": [
+                {
+                    "currency": "CNY",
+                    "total_balance": "88.80",
+                    "granted_balance": "8.80",
+                    "topped_up_balance": "80.00",
+                }
+            ],
+        }
 
 
 def main() -> None:

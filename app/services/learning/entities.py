@@ -94,6 +94,27 @@ class SubjectSummary:
 
 
 @dataclass(frozen=True)
+class ReviewDueStat:
+    """主题维度的待复习统计（FR-505），只用于主题列表。
+
+    ``due``：已排期且到期的节点数；``stale``：从未排期、但最近触达已超过阈值的
+    节点数（历史数据在第一次打开复习页前就是这个状态）。两者都算"需要复习"，
+    否则老主题在列表上永远不会被提醒。
+    """
+
+    due: int = 0
+    stale: int = 0
+
+    @property
+    def due_reviews(self) -> int:
+        return self.due + self.stale
+
+    @property
+    def needs_review(self) -> bool:
+        return self.due_reviews > 0
+
+
+@dataclass(frozen=True)
 class SessionSnapshot:
     """状态机快照：刷新恢复的唯一数据来源（FR-410）。"""
 
@@ -218,6 +239,10 @@ class KnowledgePoint:
     is_quick_review: bool = False
     mastered_at: datetime | None = None
     last_reviewed_at: datetime | None = None
+    review_box: int = 0
+    """间隔复习的 Leitner 箱号（FR-506）。0 表示"还没排过期"。"""
+    review_due_at: datetime | None = None
+    """下一次该复习的时间（UTC naive）。为空即"未排期"，由复习页懒补齐。"""
     summary_note: str | None = None
     checkpoints: tuple[Checkpoint, ...] = ()
 

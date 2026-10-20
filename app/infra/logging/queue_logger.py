@@ -24,6 +24,12 @@ CHANNEL_ERROR = "error"
 _LEVEL_VALUES = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 _DEFAULT_LEVEL = "INFO"
 _MAX_WRITE_RETRIES = 3
+# 轮转阈值与保留期的默认值；实际值由设置页决定（FR-907）
+_DEFAULT_MAX_BYTES = 5 * 1024 * 1024
+_DEFAULT_RETENTION_DAYS = 14
+
+# 正在写的通道文件：prune 不碰、clean 只截断不删除
+_ACTIVE_LOG_NAMES = frozenset({f"{CHANNEL_APP}.log", f"{CHANNEL_LLM}.log", f"{CHANNEL_ERROR}.log"})
 
 # 关停信号：投进队列让后台线程立刻醒来，而不是等它 0.1s 的取队超时。
 _STOP: None = None
@@ -64,17 +70,40 @@ class QueueLogger:
         level: str = _DEFAULT_LEVEL,
         max_queue: int = 1000,
         redactor: Redactor | None = None,
+        max_bytes: int = _DEFAULT_MAX_BYTES,
+        retention_days: int = _DEFAULT_RETENTION_DAYS,
     ) -> None:
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor or Redactor()
         self._level_value = _LEVEL_VALUES.get(level.upper(), _LEVEL_VALUES[_DEFAULT_LEVEL])
+        self._max_bytes = max_bytes
+        self._retention_days = retention_days
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=max_queue)
         self._stopping = threading.Event()
         self._dropped = 0
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._process_queue, name="welearn-log", daemon=True)
         self._worker.start()
+
+    def reconfigure(
+        self,
+        *,
+        level: str | None = None,
+        max_bytes: int | None = None,
+        retention_days: int | None = None,
+    ) -> None:
+        """设置页保存后即时生效。
+
+        只改这几个标量，**不重建后台线程**：重建会丢掉队列里尚未落盘的日志，
+        而"改个日志级别"不该导致丢日志。
+        """
+        if level is not None:
+            self._level_value = _LEVEL_VALUES.get(level.upper(), _LEVEL_VALUES[_DEFAULT_LEVEL])
+        if max_bytes is not None:
+            self._max_bytes = max_bytes
+        if retention_days is not None:
+            self._retention_days = retention_days
 
     @property
     def log_dir(self) -> Path:
@@ -121,6 +150,7 @@ class QueueLogger:
 
     def _write_record(self, channel: str, text: str) -> None:
         path = self._log_dir / f"{channel}.log"
+        self._rotate_if_needed(path)
         last_error: Exception | None = None
         for attempt in range(_MAX_WRITE_RETRIES):
             try:
@@ -133,6 +163,74 @@ class QueueLogger:
                 time.sleep(0.05 * (attempt + 1))
 
         self._write_error_record(channel, path, text, last_error)
+
+    def _rotate_if_needed(self, path: Path) -> None:
+        """按大小轮转，并顺势清理过期归档。
+
+        清理只挂在轮转上、不挂在每次写入上：每次写都去 stat 整个目录会把这件旁路设施
+        变成热路径上的开销。文件涨到阈值才轮转一次，那时扫一遍目录完全可接受。
+        """
+        if self._max_bytes <= 0:
+            return
+        try:
+            if path.stat().st_size < self._max_bytes:
+                return
+        except OSError:
+            # 文件不存在或目标是目录（写入失败路径）：不做轮转，交给写入逻辑处理
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        archived = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+        try:
+            path.rename(archived)
+        except OSError:
+            return
+        self.prune()
+
+    def prune(self, *, retention_days: int | None = None) -> tuple[int, int]:
+        """删除超过保留期的归档日志，返回（删除数, 释放字节数）。
+
+        只删**归档**（`app.20260101-...log`），不删当前正在写的 `<channel>.log`：
+        删掉活动文件会让日志忽然"消失"，排查时反而更困惑；要清空请用 `clean()`。
+        """
+        days = self._retention_days if retention_days is None else retention_days
+        cutoff = datetime.now().timestamp() - max(0, days) * 86400
+        removed = 0
+        freed = 0
+        for path in self._log_dir.glob("*.log"):
+            if path.name in _ACTIVE_LOG_NAMES:
+                continue
+            try:
+                stat = path.stat()
+                if stat.st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+                freed += stat.st_size
+            except OSError:
+                continue
+        return removed, freed
+
+    def clean(self) -> tuple[int, int]:
+        """清空当前日志并删除归档（设置页的"清理日志"入口）。"""
+        removed = 0
+        freed = 0
+        for path in self._log_dir.glob("*.log"):
+            try:
+                if path.name in _ACTIVE_LOG_NAMES:
+                    # 保留文件本身：后台线程可能正握着它；截断比删除安全
+                    size = path.stat().st_size
+                    with open(path, "w", encoding="utf-8"):
+                        pass
+                    freed += size
+                else:
+                    size = path.stat().st_size
+                    path.unlink()
+                    removed += 1
+                    freed += size
+            except OSError:
+                continue
+        return removed, freed
 
     def _report_dropped_if_any(self) -> None:
         with self._lock:

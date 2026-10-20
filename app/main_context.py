@@ -60,6 +60,12 @@ class AppContext:
             max_retries=settings.max_retries,
             timeout_seconds=settings.timeout_seconds,
         )
+        # 日志级别与轮转阈值同样是"保存即生效"，不必重启服务（FR-907）
+        self.logger.reconfigure(
+            level=settings.log_level,
+            max_bytes=settings.log_max_mb * 1024 * 1024,
+            retention_days=settings.log_retention_days,
+        )
 
     def close(self) -> None:
         """释放资源：先排空日志，再关连接池。"""
@@ -84,7 +90,13 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
     settings_service = SettingsService(db, source)
     settings = settings_service.ensure_defaults()
 
-    logger = QueueLogger(paths.resolve(LOG_DIR_NAME), level=settings.log_level, redactor=redactor)
+    logger = QueueLogger(
+        paths.resolve(LOG_DIR_NAME),
+        level=settings.log_level,
+        redactor=redactor,
+        max_bytes=settings.log_max_mb * 1024 * 1024,
+        retention_days=settings.log_retention_days,
+    )
     configure_logger(logger)
     get_logger(CHANNEL_APP).info(
         f"配置加载完成 level={settings.log_level} data_dir={paths.root} schema_version={schema_version}"

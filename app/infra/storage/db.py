@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 """当前表结构版本。
 
 - v1：设置、密钥、会话记忆、用量（P0/P1）。
@@ -40,6 +40,13 @@ SCHEMA_VERSION = 6
   - ``app_settings.use_recommended_overrides`` / ``purpose_overrides_json``：按用途的
     模型与思考档位覆盖（FR-703）。存 JSON 文本而不是逐用途加列：用途集合会随功能扩展，
     加列意味着每次都要动表结构，而这一项的形状只由设置层解释。
+- v7（P4）：
+  - ``knowledge_point.review_box`` / ``review_due_at``：间隔复习排期（FR-506）。到期日单独存，
+    不用"最近修改 + 间隔"现算——否则改个标题就会把复习计划推迟；
+  - ``app_settings.review_interval_days``：久未复习的提醒阈值（FR-505，默认 7 天）；
+  - ``app_settings.log_max_mb`` / ``log_retention_days``：日志轮转与保留（FR-907）；
+  - ``app_settings.access_token_hash``：可选访问口令（FR-903），**只存哈希**；
+  - ``app_settings.tools_enabled``：工具调用开关（FR-714），默认关闭。
 
 升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
 
@@ -70,6 +77,14 @@ _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     ("app_settings", "audit_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
     ("app_settings", "use_recommended_overrides", "BOOLEAN NOT NULL DEFAULT 0"),
     ("app_settings", "purpose_overrides_json", "TEXT"),
+    # v7（P4）：留空即走默认值，不在 DDL 里编默认值——与 temperature/top_p 同一理由
+    ("app_settings", "review_interval_days", "INTEGER"),
+    ("app_settings", "log_max_mb", "INTEGER"),
+    ("app_settings", "log_retention_days", "INTEGER"),
+    ("app_settings", "access_token_hash", "VARCHAR(64)"),
+    ("app_settings", "tools_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("knowledge_point", "review_box", "INTEGER NOT NULL DEFAULT 0"),
+    ("knowledge_point", "review_due_at", "DATETIME"),
 )
 
 

@@ -86,6 +86,7 @@ from app.services.llm.judge import JudgeInput
 from app.services.llm.memory import KIND_OFF_TOPIC, ensure_leading_system, user_message
 from app.services.llm.result import RoundResult
 from app.services.llm.structured import StructuredOutputError
+from app.services.llm.tools import build_teaching_tools
 
 
 class _Counter(TypedDict):
@@ -335,7 +336,7 @@ class TeachingService:
             self._repos.paths.update_node(node.id, state=NodeState.LEARNING)
             node = self._repos.paths.node(node.id) or node
 
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         if not self._state.snapshot(subject_id).node_taught:
             explanation = await self._explain(subject_id, path, node, session, on_delta=on_delta)
             if not explanation.ok:
@@ -515,7 +516,7 @@ class TeachingService:
             self._state.end_review(subject_id)
             raise TeachingError("这次回顾的检查点已失效，请重新点击「继续学习」。")
 
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         session.memory.add_round().add(user_message(text))
         session.persist()
 
@@ -622,7 +623,7 @@ class TeachingService:
         把节点又标回 mastered——刚降的级和刚记的薄弱点一起被抹掉，补强等于空转。
         回顾失败恰恰说明"这道题现在答不上来"，所以重问它才是补强。
         """
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         explanation = await self._explain(subject_id, path, node, session, on_delta=on_delta)
         if not explanation.ok:
             return TeachingTurn(
@@ -685,7 +686,7 @@ class TeachingService:
         if checkpoint is None:
             raise TeachingError("待回答的检查点已失效，请点击「继续学习」重新提问。")
 
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         session.memory.add_round().add(user_message(text))
         session.persist()
 
@@ -745,7 +746,7 @@ class TeachingService:
         path = self._require_path(subject_id)
         snapshot = self._state.snapshot(subject_id)
         node = self._require_node(snapshot.current_node_id)
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
 
         if decision is NodeDecision.RETEACH:
             return await self._reteach(
@@ -872,7 +873,7 @@ class TeachingService:
         auto = level is None
         chosen = hint_level_for(snapshot.node_attempts) if level is None else _clamp_level(level)
 
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         prompt = render(
             TUTOR_HINT,
             concept=self._require_subject(subject_id).title,
@@ -955,7 +956,7 @@ class TeachingService:
         node = self._require_node(snapshot.current_node_id)
         subject = self._require_subject(subject_id)
 
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         session.memory.add_round().add(user_message(text), kind=KIND_OFF_TOPIC)
         prompt = render(
             TUTOR_OFF_TOPIC,
@@ -1018,7 +1019,7 @@ class TeachingService:
         if action == ACTION_EXPLAIN:
             path = self._require_path(subject_id)
             node = self._require_node(self._state.snapshot(subject_id).current_node_id)
-            session = self._sessions.open(subject_id, ConversationKind.TEACH)
+            session = self._open_session(subject_id)
             result = await self._explain(subject_id, path, node, session, on_delta=on_delta)
             if not result.ok:
                 return self._failure_turn(result, path, node, phase="explain")
@@ -1038,7 +1039,7 @@ class TeachingService:
         direction = action.split(":", 1)[1] if ":" in action else None
         path = self._require_path(subject_id)
         node = self._require_node(self._state.snapshot(subject_id).current_node_id)
-        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        session = self._open_session(subject_id)
         return await self._reteach(
             subject_id,
             path,
@@ -1456,6 +1457,19 @@ class TeachingService:
         if snapshot.state is SubjectState.TEACHING:
             self._state.transition(subject_id, SubjectState.COMPLETED)
             self._log.info(f"全部节点完成，主题标记为已完成 subject={subject_id}")
+
+    def _open_session(self, subject_id: str) -> ConversationSession:
+        """打开教学会话，并在开关打开时挂上工具（FR-714）。
+
+        工具在工厂之后挂载，是因为注册表需要 ``subject_id`` 与仓储，而会话工厂只负责
+        "记忆 + 执行器"。执行器持有工具时会自动把 ``tools_enabled`` 置真——
+        携带 ``tools`` 的请求必须回传历史 ``reasoning_content``，这是官方硬性要求，
+        所以不能靠调用方"记得再传一个参数"。
+        """
+        session = self._sessions.open(subject_id, ConversationKind.TEACH)
+        if self._settings().tools_enabled:
+            session.executor = session.executor.with_tools(build_teaching_tools(self._repos, subject_id))
+        return session
 
     def _counter(self, path: LearningPath, node: KnowledgePoint | None) -> _Counter:
         ordered = path.ordered_nodes()

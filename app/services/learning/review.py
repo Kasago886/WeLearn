@@ -1,4 +1,4 @@
-"""薄弱点与复习（T3.3，FR-502~FR-504、FR-507）。
+"""薄弱点与复习（T3.3/T4.1，FR-502~FR-507）。
 
 设计要点
 
@@ -9,12 +9,17 @@
   这样既省一次模型调用，又保证判定有可依据的 ``expected_points``——没有要点就无法判定。
 - **通过才升级为已掌握并解除薄弱点**（FR-503）；不通过则累加失败次数并给出更基础的
   建议（FR-504），节点状态保持不变——"复习没通过"不该把原本的 partial 变成别的状态。
+- **复习结果同时决定下一次复习时间**（FR-506）：通过升档、不通过回第一档（阶梯见
+  ``schedule``）。只记录对错而不排下一次，"已掌握"的内容就再也不会被回顾，而遗忘
+  恰恰发生在掌握之后。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 
 from app.contracts.schemas import ConversationKind, JudgementResult, NodeState, WeakPointReason
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
+from app.infra.storage.models import utcnow
 from app.services.learning.entities import (
     ANSWER_SOURCE_REVIEW,
     REVIEW_MODE_WEAK,
@@ -26,6 +31,13 @@ from app.services.learning.entities import (
 )
 from app.services.learning.planning import PlanningService
 from app.services.learning.repository import DomainRepositories
+from app.services.learning.schedule import (
+    interval_days,
+    is_due,
+    schedule_after_fail,
+    schedule_after_mastery,
+    schedule_after_pass,
+)
 from app.services.learning.session import ConversationSession, ConversationSessionFactory
 from app.services.learning.state import SessionStateService
 from app.services.llm.agent import DeltaCallback
@@ -55,16 +67,40 @@ class WeakPointView:
 
 
 @dataclass(frozen=True)
+class DueReviewView:
+    """到期复习项（FR-506）：一个"现在就该回顾"的已掌握节点。"""
+
+    node: KnowledgePoint
+    node_index: int
+    node_total: int
+    interval_days: int
+    """当前箱号对应的间隔天数，界面用它说明"这次隔了几天"。"""
+
+    @property
+    def node_title(self) -> str:
+        return self.node.title
+
+    @property
+    def due_at(self) -> datetime | None:
+        return self.node.review_due_at
+
+
+@dataclass(frozen=True)
 class ReviewOverview:
-    """复习概览（FR-502、FR-804）。"""
+    """复习概览（FR-502、FR-506、FR-804）。"""
 
     items: tuple[WeakPointView, ...]
     node_total: int
     mastered_count: int
+    due: tuple[DueReviewView, ...] = ()
 
     @property
     def open_count(self) -> int:
         return len(self.items)
+
+    @property
+    def due_count(self) -> int:
+        return len(self.due)
 
 
 @dataclass
@@ -118,11 +154,21 @@ class ReviewService:
     # 概览与清单
     # ------------------------------------------------------------------ #
 
-    def overview(self, subject_id: str) -> ReviewOverview:
-        """薄弱点清单 + 进度（FR-502、FR-804）。"""
+    def overview(self, subject_id: str, *, now: datetime | None = None) -> ReviewOverview:
+        """薄弱点清单 + 进度 + 到期复习（FR-502、FR-506、FR-804）。
+
+        **懒补齐为什么放在读取路径上**：节点变成"已掌握"的入口不止一个——教学判定
+        通过、复习通过、路径重生成都会产生 mastered 节点，逐个入口挂钩既容易漏
+        （新加一个入口就少一处），也会把排期逻辑摊到三个模块里。而补齐只在
+        ``review_due_at`` 为空时发生：第一次读取写入初始排期，之后读多少次都不再
+        改动，因此放在读取路径上不会产生副作用累积，也顺带覆盖了功能上线前的
+        历史数据。
+        """
         self._require_subject(subject_id)
+        moment = now or utcnow()
         path = self._planning.current_path(subject_id)
         ordered = path.ordered_nodes() if path is not None else ()
+        ordered = self._backfill_schedules(ordered, moment)
         index_of = {node.id: position for position, node in enumerate(ordered, start=1)}
         mastered = sum(1 for node in ordered if node.state is NodeState.MASTERED)
 
@@ -135,7 +181,28 @@ class ReviewService:
             )
             for point in self._repos.weak_points.list_open(subject_id)
         )
-        return ReviewOverview(items=items, node_total=len(ordered), mastered_count=mastered)
+        due = tuple(
+            sorted(
+                (
+                    DueReviewView(
+                        node=node,
+                        node_index=index_of.get(node.id, 0),
+                        node_total=len(ordered),
+                        interval_days=interval_days(node.review_box),
+                    )
+                    for node in ordered
+                    if node.state is NodeState.MASTERED and is_due(node.review_due_at, moment)
+                ),
+                # 拖得最久的排在最前：用户最可能已经忘了它
+                key=lambda view: view.node.review_due_at or moment,
+            )
+        )
+        return ReviewOverview(
+            items=items,
+            node_total=len(ordered),
+            mastered_count=mastered,
+            due=due,
+        )
 
     def history(self, subject_id: str, node_id: str) -> list[AnswerRecord]:
         """某节点的复习记录（FR-507）。"""
@@ -283,8 +350,19 @@ class ReviewService:
         checkpoint: Checkpoint,
         judgement: JudgementResult,
     ) -> ReviewTurn:
-        """复习通过：升级为已掌握 + 解除薄弱点（FR-503，即 AC-22）。"""
-        self._repos.paths.update_node(node.id, state=NodeState.MASTERED)
+        """复习通过：升级为已掌握 + 解除薄弱点 + 排期后移（FR-503、FR-506，即 AC-22）。"""
+        moment = utcnow()
+        box, due_at = schedule_after_pass(node.review_box, moment)
+        self._repos.paths.update_node(
+            node.id,
+            state=NodeState.MASTERED,
+            review_box=box,
+            review_due_at=due_at,
+            last_reviewed_at=moment,
+            # 复习通过才第一次变成已掌握的节点，这时才需要补掌握时间；
+            # 已经有掌握时间的节点保留原值，否则"什么时候学会的"会被复习时间覆盖。
+            mastered_at=node.mastered_at or moment,
+        )
         self._repos.weak_points.resolve(subject_id, node.id)
         self._state.end_review(subject_id)
         refreshed = self._repos.paths.node(node.id) or node
@@ -313,6 +391,10 @@ class ReviewService:
         judgement: JudgementResult,
     ) -> ReviewTurn:
         """复习不通过：保留薄弱点、累计失败次数，并给出更基础的建议（FR-504）。"""
+        # 排期回到第一档：刚证明记不住，下次仍然隔一天就问，别让节点一直躺在
+        # "已掌握、几十天后才复习"的状态里（FR-506）。
+        box, due_at = schedule_after_fail(utcnow())
+        self._repos.paths.update_node(node.id, review_box=box, review_due_at=due_at)
         recorded = self._repos.weak_points.record(subject_id, node.id, WeakPointReason.PARTIAL)
         self._state.end_review(subject_id)
         suggestion = self._suggestion(judgement.missing_points)
@@ -381,6 +463,33 @@ class ReviewService:
             None,
         )
         return point.fail_count if point is not None else 0
+
+    def _backfill_schedules(
+        self,
+        nodes: tuple[KnowledgePoint, ...],
+        now: datetime,
+    ) -> tuple[KnowledgePoint, ...]:
+        """给"已掌握但没有排期"的节点补上初始排期（幂等）。
+
+        初始到期日以 ``mastered_at`` 为锚点：老节点往往几十天前就学会了，用
+        "现在 + 1 天"会让它看起来还有一天才到期，实际上早该复习。没有掌握时间的
+        （历史上教学通过时没记 ``mastered_at``）才退回当前时间。
+
+        只改 ``review_box`` / ``review_due_at`` 这两个字段，其余字段原样返回，
+        调用方不需要再查一次路径。
+        """
+        if not nodes:
+            return nodes
+
+        filled: list[KnowledgePoint] = []
+        for node in nodes:
+            if node.state is not NodeState.MASTERED or node.review_due_at is not None:
+                filled.append(node)
+                continue
+            box, due_at = schedule_after_mastery(node.mastered_at or now)
+            self._repos.paths.update_node(node.id, review_box=box, review_due_at=due_at)
+            filled.append(replace(node, review_box=box, review_due_at=due_at))
+        return tuple(filled)
 
     def _node_index(self, subject_id: str, node_id: str) -> int:
         path = self._planning.current_path(subject_id)

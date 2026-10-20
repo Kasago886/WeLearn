@@ -11,9 +11,9 @@
 import json
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, case, delete, func, select
 
 from app.contracts.schemas import (
     AssessmentStatus,
@@ -47,6 +47,7 @@ from app.services.learning.entities import (
     KnowledgePoint,
     LearningPath,
     ProfileLevel,
+    ReviewDueStat,
     SessionSnapshot,
     StudyNote,
     Subject,
@@ -182,6 +183,8 @@ def _to_node(row: KnowledgePointRow, checkpoints: Sequence[Checkpoint] = ()) -> 
         is_quick_review=row.is_quick_review,
         mastered_at=row.mastered_at,
         last_reviewed_at=row.last_reviewed_at,
+        review_box=row.review_box or 0,
+        review_due_at=row.review_due_at,
         summary_note=row.summary_note,
         checkpoints=tuple(checkpoints),
     )
@@ -409,6 +412,49 @@ class SubjectRepository:
 
         candidates = [value for value in (by_answer, by_usage) if value is not None]
         return max(candidates) if candidates else None
+
+    def review_stats(self, *, interval_days: int, now: datetime | None = None) -> dict[str, ReviewDueStat]:
+        """各主题的待复习计数（FR-505），供主题列表一次取回。
+
+        列表页每行都要这个数字，逐主题查就是 N+1；这里用一条分组查询算出两种情形：
+        已排期且到期（``due``）、以及从未排期但最近触达已超阈值（``stale``）——
+        后者覆盖"排期功能上线前就已掌握"的历史节点。
+
+        只看活动路径：旧版本路径上的节点已经不是用户眼前的进度，把它们算进来会
+        让列表页的提醒永远清不掉。
+        """
+        moment = now or utcnow()
+        cutoff = moment - timedelta(days=max(1, int(interval_days)))
+        anchor = func.coalesce(KnowledgePointRow.last_reviewed_at, KnowledgePointRow.mastered_at)
+        due_condition = and_(
+            KnowledgePointRow.review_due_at.is_not(None),
+            KnowledgePointRow.review_due_at <= moment,
+        )
+        stale_condition = and_(
+            KnowledgePointRow.review_due_at.is_(None),
+            anchor.is_not(None),
+            anchor < cutoff,
+        )
+        statement = (
+            select(
+                LearningPathRow.subject_id,
+                func.count(case((due_condition, 1))).label("due_count"),
+                func.count(case((stale_condition, 1))).label("stale_count"),
+            )
+            .join(KnowledgePointRow, KnowledgePointRow.path_id == LearningPathRow.id)
+            .where(
+                LearningPathRow.is_active.is_(True),
+                KnowledgePointRow.state == NodeState.MASTERED.value,
+            )
+            .group_by(LearningPathRow.subject_id)
+        )
+
+        with self._db.session() as session:
+            rows = session.execute(statement).all()
+        return {
+            subject_id: ReviewDueStat(due=int(due_count or 0), stale=int(stale_count or 0))
+            for subject_id, due_count, stale_count in rows
+        }
 
     def summaries(self, *, include_archived: bool = False) -> list[SubjectSummary]:
         return [
@@ -790,7 +836,15 @@ class PathRepository:
             return _to_checkpoint(row) if row is not None else None
 
     def update_node(self, node_id: str, **fields: object) -> KnowledgePoint | None:
-        allowed = {"state", "attempts", "mastered_at", "last_reviewed_at", "summary_note"}
+        allowed = {
+            "state",
+            "attempts",
+            "mastered_at",
+            "last_reviewed_at",
+            "review_box",
+            "review_due_at",
+            "summary_note",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"不支持更新的字段: {sorted(unknown)}")

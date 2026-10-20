@@ -1,4 +1,4 @@
-"""一轮对话执行器（T1.2，FR-610、FR-412）。
+"""一轮对话执行器（T1.2，FR-610、FR-412；工具调用 T4.6，FR-714）。
 
 核心不变量：**在副本上执行，成功后才提交**。
 
@@ -13,23 +13,42 @@ working += 用户输入
 这样"失败轮次污染上下文"这个 bug 在结构上不可能发生（对应 `tests/test_agent.py`
 里的失败用例），也让重试变得廉价——重试只需重跑副本，无需回滚。
 
-工具调用（FR-714）不在此实现，属于 P2 范围。
+工具调用（FR-714）也发生在**同一个工作副本**上：assistant 的 `tool_calls` 消息与随后的
+`tool` 结果消息都只写进副本，最终正文成功后才整体提交。中间轮失败时整轮不提交，
+不会留下"有 tool_calls 却没有对应 tool 结果"的非法历史。
+
+两条官方限制在这里的落点：
+
+1. **思考模式不支持 `tool_choice="required"` 与指定具体工具**——执行器从不下发
+   `tool_choice`，只把 `tools` 交给协议层（见 :mod:`app.infra.deepseek.protocol`）；
+2. **携带 `tools` 时历史轮次的 `reasoning_content` 必须回传**——因此只要持有工具，
+   :attr:`RoundExecutor.tools_enabled` 就为真，:func:`build_outbound_messages` 会保留思维链。
+   这两件事必须同时成立，否则就是"带 tools 却不回传思维链"的自相矛盾状态，
+   所以由 :attr:`tools_enabled` 的计算属性兜住，而不是让调用方记得传两个参数。
 """
 
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.contracts.schemas import LlmPurpose
 from app.infra.deepseek.client import LlmClientProtocol
 from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import StreamEvent, TokenUsage
+from app.infra.deepseek.protocol import StreamEvent, TokenUsage, ToolCall
 from app.infra.logging.queue_logger import CHANNEL_LLM, get_logger
 from app.services.llm.context_policy import build_outbound_messages
-from app.services.llm.memory import Memory, assistant_message, system_message, user_message
+from app.services.llm.memory import (
+    Memory,
+    assistant_message,
+    system_message,
+    tool_message,
+    user_message,
+)
 from app.services.llm.policy import ModelPolicy
 from app.services.llm.result import RoundResult
+from app.services.llm.tools import ToolRegistry
 
 DeltaCallback = Callable[[StreamEvent], None]
 
@@ -40,10 +59,61 @@ UsageCallback = Callable[[LlmPurpose, str, TokenUsage | None, int | None], None]
 只有执行器知道——客户端只负责发请求，不关心统计。
 """
 
+MAX_TOOL_ROUNDS = 3
+"""工具执行轮次上限。
+
+不设上限的风险很具体：模型可能反复调用同一个工具（参数每次略有不同），
+于是整轮对话永不结束、额度被烧光。到达上限后再发一次**不带 tools** 的请求，
+逼它把已有信息组织成正文。
+"""
+
 
 def _elapsed_ms(started: float) -> int:
     return max(0, round((time.monotonic() - started) * 1000))
 
+
+def tool_kwargs(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """把 ``tools`` 组装成"只在需要时传"的关键字参数。
+
+    一律传 ``tools=None`` 会改变既有桩客户端/第三方实现的调用签名兼容性；
+    不携带工具的请求本就不该出现这个字段（官方不接受 ``"tools": null``）。
+    """
+    return {"tools": tools} if tools else {}
+
+
+def _merge_usage(left: TokenUsage | None, right: TokenUsage | None) -> TokenUsage | None:
+    """合并多轮调用的用量：一次工具调用链实际发生了多次计费，只记最后一轮会漏账。"""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return TokenUsage(
+        prompt_tokens=left.prompt_tokens + right.prompt_tokens,
+        cached_prompt_tokens=left.cached_prompt_tokens + right.cached_prompt_tokens,
+        cache_miss_tokens=left.cache_miss_tokens + right.cache_miss_tokens,
+        completion_tokens=left.completion_tokens + right.completion_tokens,
+        reasoning_tokens=left.reasoning_tokens + right.reasoning_tokens,
+        total_tokens=left.total_tokens + right.total_tokens,
+    )
+
+
+@dataclass
+class _RoundCapture:
+    """单次模型调用的产出，用于判断"这是中间轮还是最终轮"。"""
+
+    content: list[str] = field(default_factory=list)
+    reasoning: list[str] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: TokenUsage | None = None
+    interrupted: bool = False
+
+    @property
+    def content_text(self) -> str:
+        return "".join(self.content)
+
+    @property
+    def reasoning_text(self) -> str:
+        return "".join(self.reasoning)
 
 
 class RoundExecutor:
@@ -58,6 +128,7 @@ class RoundExecutor:
         on_usage: UsageCallback | None = None,
         tools_enabled: bool = False,
         conversation_id: str | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
         self._client = client
         self._memory = memory
@@ -65,6 +136,7 @@ class RoundExecutor:
         self._on_usage = on_usage
         self._tools_enabled = tools_enabled
         self._conversation_id = conversation_id
+        self._tools = tools
         self._log = get_logger(CHANNEL_LLM)
 
     @property
@@ -73,13 +145,33 @@ class RoundExecutor:
 
     @property
     def tools_enabled(self) -> bool:
-        """是否按"携带 tools"的规则处理上下文（FR-719）。"""
-        return self._tools_enabled
+        """是否按"携带 tools"的规则处理上下文（FR-719）。
+
+        持有工具就必然为真：请求里带了 `tools` 却剔除 `reasoning_content`，
+        正是官方明确不允许的组合（见模块文档）。
+        """
+        return self._tools_enabled or self._tools is not None
+
+    @property
+    def tools(self) -> ToolRegistry | None:
+        return self._tools
 
     @property
     def policy(self) -> ModelPolicy:
         """当前用途策略（结构化输出通道需要它来取默认 max_tokens）。"""
         return self._policy
+
+    def with_tools(self, tools: ToolRegistry | None) -> "RoundExecutor":
+        """挂上/摘掉工具，返回新执行器（记忆与其余配置沿用）。"""
+        return RoundExecutor(
+            self._client,
+            self._memory,
+            self._policy,
+            on_usage=self._on_usage,
+            tools_enabled=self._tools_enabled,
+            conversation_id=self._conversation_id,
+            tools=tools,
+        )
 
     def with_memory(self, memory: Memory) -> "RoundExecutor":
         """换一份记忆复用同一套配置（教学/测评/复习各持自己的记忆）。"""
@@ -90,6 +182,7 @@ class RoundExecutor:
             on_usage=self._on_usage,
             tools_enabled=self._tools_enabled,
             conversation_id=self._conversation_id,
+            tools=self._tools,
         )
 
     # ------------------------------------------------------------------ #
@@ -110,42 +203,101 @@ class RoundExecutor:
         ``stop_event`` 用于"停止生成"（FR-412）：置位后**优雅中断**，
         已生成内容会被提交并标记 ``interrupted=True``，避免用户已看到的内容丢失。
         与之相对，任务被硬取消（``CancelledError``）时不提交，保持记忆干净。
+
+        启用工具时，一次"轮"内可能发生多次模型调用（工具调用 → 结果 → 再调用）。
+        最终正文照常提交；中间轮若也生成了正文，**丢弃并记日志**——
+        "我先查一下档案"这种话对用户没有价值，展示出来反而像卡住了。
         """
         working = self._prepare(user_prompt, system_prompt)
         choice = self._policy.resolve(purpose)
-        messages = build_outbound_messages(working, tools_enabled=self._tools_enabled)
+        tool_specs = self._tools.specs() if self._tools is not None else None
+        # 带 tools 时正文先暂存、等本轮确认没有 tool_calls 再推给前端；
+        # 不带 tools 时保持既有的逐块实时推送（这是默认路径，行为不能变）
+        defer_content = tool_specs is not None
+
+        def flush_content(text: str) -> None:
+            if on_delta is not None and defer_content and text:
+                on_delta(StreamEvent(content=text))
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         usage: TokenUsage | None = None
         interrupted = False
         started = time.monotonic()
+        tool_rounds = 0
 
         try:
-            async for event in self._client.stream_chat(
-                model=choice.model,
-                messages=messages,
-                thinking=choice.thinking,
-                reasoning_effort=choice.reasoning_effort,
-                max_tokens=choice.max_tokens,
-                purpose=purpose,
-                timeout_seconds=choice.timeout_seconds,
-            ):
+            while True:
                 if stop_event is not None and stop_event.is_set():
                     interrupted = True
                     break
 
-                if event.is_usage_only:
-                    usage = event.usage
-                    continue
+                # 到达上限后不再给工具：逼模型把已有信息组织成正文，避免无限循环
+                use_tools = tool_specs if (tool_specs is not None and tool_rounds < MAX_TOOL_ROUNDS) else None
+                messages = build_outbound_messages(working, tools_enabled=self.tools_enabled)
+                capture = _RoundCapture()
 
-                if event.reasoning:
-                    reasoning_parts.append(event.reasoning)
-                if event.content:
-                    content_parts.append(event.content)
+                async for event in self._client.stream_chat(
+                    model=choice.model,
+                    messages=messages,
+                    thinking=choice.thinking,
+                    reasoning_effort=choice.reasoning_effort,
+                    max_tokens=choice.max_tokens,
+                    purpose=purpose,
+                    timeout_seconds=choice.timeout_seconds,
+                    **tool_kwargs(use_tools),
+                ):
+                    if stop_event is not None and stop_event.is_set():
+                        capture.interrupted = True
+                        break
 
-                if on_delta is not None:
-                    on_delta(event)
+                    if event.usage is not None:
+                        capture.usage = event.usage
+                    if event.is_usage_only:
+                        continue
+
+                    if event.reasoning:
+                        capture.reasoning.append(event.reasoning)
+                    if event.content:
+                        capture.content.append(event.content)
+                    if event.tool_calls:
+                        capture.tool_calls.extend(event.tool_calls)
+
+                    if on_delta is not None:
+                        if not defer_content:
+                            on_delta(event)
+                        elif event.reasoning:
+                            # 思维链不是正文，实时推送不会泄露中间轮的过渡语
+                            on_delta(StreamEvent(reasoning=event.reasoning))
+
+                usage = _merge_usage(usage, capture.usage)
+                if capture.interrupted:
+                    interrupted = True
+                    content_parts.extend(capture.content)
+                    reasoning_parts.extend(capture.reasoning)
+                    flush_content(capture.content_text)
+                    break
+
+                if not capture.tool_calls:
+                    content_parts.extend(capture.content)
+                    reasoning_parts.extend(capture.reasoning)
+                    flush_content(capture.content_text)
+                    break
+
+                if use_tools is None:
+                    # 没带 tools 却仍返回 tool_calls：协议异常。执行它/再请求都可能死循环
+                    self._log.warning(
+                        f"未携带 tools 的请求仍返回 tool_calls，按空正文收尾 purpose={purpose.value} "
+                        f"count={len(capture.tool_calls)}"
+                    )
+                    break
+
+                if capture.content_text.strip():
+                    self._log.info(
+                        f"丢弃工具中间轮的正文 purpose={purpose.value} chars={len(capture.content_text)}"
+                    )
+                self._apply_tool_calls(working, capture)
+                tool_rounds += 1
         except LlmError as exc:
             return self._fail(exc, purpose, choice.model, usage, _elapsed_ms(started))
         except asyncio.CancelledError:
@@ -192,28 +344,56 @@ class RoundExecutor:
         """非流式执行一轮（判定、压缩等场景）。"""
         working = self._prepare(user_prompt, system_prompt)
         choice = self._policy.resolve(purpose)
-        messages = build_outbound_messages(working, tools_enabled=self._tools_enabled)
+        tool_specs = self._tools.specs() if self._tools is not None else None
 
         started = time.monotonic()
+        usage: TokenUsage | None = None
+        reasoning_parts: list[str] = []
+        tool_rounds = 0
         try:
-            result = await self._client.chat(
-                model=choice.model,
-                messages=messages,
-                thinking=choice.thinking,
-                reasoning_effort=choice.reasoning_effort,
-                max_tokens=choice.max_tokens,
-                purpose=purpose,
-                timeout_seconds=choice.timeout_seconds,
-            )
-        except LlmError as exc:
-            return self._fail(exc, purpose, choice.model, None, _elapsed_ms(started))
+            while True:
+                use_tools = tool_specs if (tool_specs is not None and tool_rounds < MAX_TOOL_ROUNDS) else None
+                messages = build_outbound_messages(working, tools_enabled=self.tools_enabled)
+                result = await self._client.chat(
+                    model=choice.model,
+                    messages=messages,
+                    thinking=choice.thinking,
+                    reasoning_effort=choice.reasoning_effort,
+                    max_tokens=choice.max_tokens,
+                    purpose=purpose,
+                    timeout_seconds=choice.timeout_seconds,
+                    **tool_kwargs(use_tools),
+                )
+                usage = _merge_usage(usage, result.usage)
+                reasoning_parts = [result.reasoning] if result.reasoning else []
 
-        reasoning_parts = [result.reasoning] if result.reasoning else []
+                if not result.tool_calls:
+                    break
+                if use_tools is None:
+                    self._log.warning(
+                        f"未携带 tools 的请求仍返回 tool_calls，按空正文收尾 purpose={purpose.value} "
+                        f"count={len(result.tool_calls)}"
+                    )
+                    break
+                if result.content.strip():
+                    self._log.info(f"丢弃工具中间轮的正文 purpose={purpose.value} chars={len(result.content)}")
+
+                capture = _RoundCapture(
+                    content=[result.content] if result.content else [],
+                    reasoning=[result.reasoning] if result.reasoning else [],
+                    tool_calls=list(result.tool_calls),
+                    usage=result.usage,
+                )
+                self._apply_tool_calls(working, capture)
+                tool_rounds += 1
+        except LlmError as exc:
+            return self._fail(exc, purpose, choice.model, usage, _elapsed_ms(started))
+
         return self._commit(
             working,
             result.content,
             reasoning_parts,
-            result.usage,
+            usage,
             purpose=purpose,
             model=choice.model,
             interrupted=False,
@@ -250,6 +430,34 @@ class RoundExecutor:
     # ------------------------------------------------------------------ #
     # 内部实现
     # ------------------------------------------------------------------ #
+
+    def _apply_tool_calls(self, working: Memory, capture: _RoundCapture) -> None:
+        """把中间轮的 ``assistant(tool_calls)`` 与工具结果写进**本轮工作副本**。
+
+        只写副本、不写正式记忆：中间轮之后如果模型调用失败，整轮不提交，
+        否则会留下"有 tool_calls 却没有对应 tool 结果"的非法历史——下一轮请求会被服务端拒绝。
+        """
+        working.add_message_to_last_round(
+            assistant_message(
+                capture.content_text or None,
+                capture.reasoning_text or None,
+                [call.to_payload() for call in capture.tool_calls],
+            )
+        )
+        for call in capture.tool_calls:
+            working.add_message_to_last_round(tool_message(call.id, self._execute_tool(call)))
+
+    def _execute_tool(self, call: ToolCall) -> str:
+        """执行一次工具调用；**任何错误都变成给模型看的结果文本**（见 tools 模块说明）。"""
+        if self._tools is None:
+            return "错误：当前会话没有可用的工具。"
+        try:
+            result = self._tools.execute(call)
+        except Exception as exc:  # 兜底：execute 本身保证不抛，这里防的是将来改坏
+            self._log.warning(f"工具执行异常（已转为错误文本） name={call.name} {type(exc).__name__}: {exc}")
+            result = f"错误：工具 {call.name} 执行失败（{type(exc).__name__}）。请换一种做法或先读档案。"
+        self._log.info(f"工具调用 name={call.name} id={call.id} chars={len(result)}")
+        return result
 
     def _prepare(self, user_prompt: str | None, system_prompt: str | None) -> Memory:
         working = self._memory.snapshot()

@@ -30,6 +30,7 @@ from app.infra.deepseek.protocol import (
     ModelInfo,
     SamplingOptions,
     StreamEvent,
+    ToolCallAccumulator,
     build_chat_request,
     build_endpoint,
     extract_delta,
@@ -85,6 +86,7 @@ class LlmClientProtocol(Protocol):
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]: ...
 
     async def chat(
@@ -98,6 +100,7 @@ class LlmClientProtocol(Protocol):
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> BlockingResult: ...
 
 
@@ -180,6 +183,7 @@ class DeepSeekClient:
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """流式对话。
 
@@ -189,11 +193,15 @@ class DeepSeekClient:
         - **正文一个字都没有则算失败、可以重试**：思考模式下模型有概率把输出预算全花在
           思维链上，正文为空。此时用户并没有看到任何正文，重试不会造成重复内容；
           而如果不重试，就会落一条空回复——界面上什么都不显示，看着像卡死了。
+
+        工具调用（FR-714）与正文同等看待：只要已经产出过 tool_calls，就**不再重试**，
+        否则同一批工具可能被执行两次。
         """
         attempt = 0
 
         while True:
             content_emitted = False
+            tool_calls_emitted = False
             try:
                 async for event in self._stream_once(
                     model=model,
@@ -204,16 +212,19 @@ class DeepSeekClient:
                     json_object=json_object,
                     purpose=purpose,
                     timeout_seconds=timeout_seconds,
+                    tools=tools,
                 ):
                     if event.content:
                         content_emitted = True
+                    if event.tool_calls:
+                        tool_calls_emitted = True
                     yield event
             except LlmError as exc:
-                if content_emitted:
+                if content_emitted or tool_calls_emitted:
                     raise
                 error = exc
             else:
-                if content_emitted:
+                if content_emitted or tool_calls_emitted:
                     return
                 error = LlmError.empty_content(f"purpose={purpose.value} model={model}")
 
@@ -237,6 +248,7 @@ class DeepSeekClient:
         json_object: bool,
         purpose: LlmPurpose,
         timeout_seconds: int | None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         url = build_endpoint(self._base_url_getter(), CHAT_COMPLETIONS_PATH)
         body = build_chat_request(
@@ -248,6 +260,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             json_object=json_object,
             sampling=self._sampling(),
+            tools=tools,
         )
         self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
 
@@ -270,6 +283,7 @@ class DeepSeekClient:
                     raise self._error_from_response(response.status_code, raw)
 
                 parser = SseEventParser()
+                accumulator = ToolCallAccumulator()
                 # 在同一异步循环中驱动同步解析器：忽略空行、`: keep-alive` 注释与其他字段行
                 async for line in response.aiter_lines():
                     if audit_enabled:
@@ -293,6 +307,8 @@ class DeepSeekClient:
                         content, reasoning = extract_delta(chunk)
                         if content or reasoning:
                             yield StreamEvent(content=content, reasoning=reasoning)
+                        # 工具调用增量没有可展示的正文，累积到流结束一次性给出
+                        accumulator.feed(chunk)
         except httpx.TimeoutException as exc:
             raise LlmError.timeout(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -301,6 +317,10 @@ class DeepSeekClient:
 
         if audit_enabled:
             self._log_response(purpose, model, "\n".join(audit_lines))
+
+        tool_calls = accumulator.finish()
+        if tool_calls:
+            yield StreamEvent(tool_calls=tool_calls)
 
         if last_usage is not None:
             self._log_usage(purpose, model, last_usage)
@@ -323,6 +343,7 @@ class DeepSeekClient:
         json_object: bool = False,
         purpose: LlmPurpose = LlmPurpose.TEACH,
         timeout_seconds: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> BlockingResult:
         """非流式对话（判定、压缩等场景）。"""
         url = build_endpoint(self._base_url_getter(), CHAT_COMPLETIONS_PATH)
@@ -335,6 +356,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             json_object=json_object,
             sampling=self._sampling(),
+            tools=tools,
         )
         self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
 
