@@ -62,12 +62,61 @@ async function readDetail(response: Response): Promise<string> {
 
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
 
+const TOKEN_STORAGE_KEY = 'welearn.access_token'
+
+/** 可选访问口令（FR-903）。存在 localStorage：本机自托管，没有更合适的存放处。 */
+export function getAccessToken(): string | null {
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function setAccessToken(token: string | null): void {
+  try {
+    if (token) {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, token)
+    } else {
+      window.localStorage.removeItem(TOKEN_STORAGE_KEY)
+    }
+  } catch {
+    // 隐私模式下 localStorage 可能不可写：口令只影响本次会话，不影响其它功能
+  }
+}
+
+/** 带上口令的请求头；未设置口令时不发这个头。 */
+export function authHeaders(): Record<string, string> {
+  const token = getAccessToken()
+  return token ? { 'X-Access-Token': token } : {}
+}
+
+let authNotified = false
+
+/**
+ * 口令失效时通知界面弹一次输入框。
+ *
+ * 去重很重要：打开一个页面会并发好几个请求，不去重就会一次弹出五个口令框。
+ */
+function notifyAuthRequired(): void {
+  if (authNotified) return
+  authNotified = true
+  window.dispatchEvent(new CustomEvent('welearn:auth-required'))
+}
+
+export function resetAuthNotice(): void {
+  authNotified = false
+}
+
 async function request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   let response: Response
   try {
     response = await fetch(path, {
       method,
-      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      headers: {
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...authHeaders(),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
     })
@@ -76,6 +125,12 @@ async function request<T>(method: string, path: string, body?: unknown, signal?:
       throw error
     }
     throw new NetworkError('无法连接到后端服务，请确认服务已启动（默认 127.0.0.1:8000）。')
+  }
+
+  if (response.status === 401) {
+    notifyAuthRequired()
+  } else if (response.ok) {
+    resetAuthNotice()
   }
 
   if (!response.ok) {

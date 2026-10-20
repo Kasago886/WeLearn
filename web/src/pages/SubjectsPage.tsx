@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 import { errorMessage } from '../api/client'
 import { subjectsApi } from '../api/endpoints'
@@ -79,6 +79,13 @@ function SubjectCard({ item, onChange }: { item: SubjectListItem; onChange: () =
         <SubjectStateBadge state={item.status} />
       </div>
 
+      {item.needs_review ? (
+        <p className="small" style={{ color: 'var(--warn)' }}>
+          建议复习：
+          {item.due_reviews && item.due_reviews > 0 ? `${item.due_reviews} 个节点已到期` : '有已掌握的节点久未复习'}
+        </p>
+      ) : null}
+
       <p className="muted small">
         进度 已掌握 {mastered} · 薄弱点 {item.progress.weak_points} · 最近学习 {formatTime(item.last_studied_at)}
       </p>
@@ -128,11 +135,28 @@ function SubjectCard({ item, onChange }: { item: SubjectListItem; onChange: () =
 
 export function SubjectsPage() {
   const [includeArchived, setIncludeArchived] = useState(false)
+  const [importProblem, setImportProblem] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
+  const navigate = useNavigate()
   const { data, error, loading, reload } = useResource(
     () => subjectsApi.list(includeArchived),
     [includeArchived],
   )
   const items: SubjectListItem[] = data?.items ?? []
+
+  async function importFile(file: File): Promise<void> {
+    setImporting(true)
+    setImportProblem(null)
+    try {
+      const payload = JSON.parse(await file.text()) as unknown
+      const created = await subjectsApi.importData(payload)
+      navigate(`/subjects/${created.subject_id}/archive`)
+    } catch (cause) {
+      setImportProblem(errorMessage(cause))
+    } finally {
+      setImporting(false)
+    }
+  }
 
   return (
     <div className="stack">
@@ -154,8 +178,27 @@ export function SubjectsPage() {
           <Link className="btn btn-primary" to="/new">
             新建学习主题
           </Link>
+          <label className="btn btn-sm" style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <input
+              type="file"
+              accept="application/json,.json"
+              style={{ width: 'auto' }}
+              disabled={importing}
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                if (file) {
+                  void importFile(file)
+                }
+                // 允许连续导入同一个文件：不清空的话第二次选它不会触发 change
+                event.target.value = ''
+              }}
+            />
+            {importing ? '正在导入…' : '导入主题备份'}
+          </label>
         </div>
       </div>
+
+      {importProblem ? <Banner>{importProblem}</Banner> : null}
 
       {error ? (
         <Banner onRetry={reload}>{error}</Banner>

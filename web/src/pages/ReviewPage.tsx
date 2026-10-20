@@ -270,6 +270,44 @@ export function ReviewPage() {
         </section>
       ) : null}
 
+      {data.due_count > 0 ? (
+        <section className="card stack" aria-label="今日复习">
+          <div className="row-between">
+            <h2>今日复习（{data.due_count}）</h2>
+            <span className="muted small">按间隔复习排期到期的已掌握节点（FR-506）</span>
+          </div>
+          <div className="grid-cards">
+            {data.due.map((item) => (
+              <article className="card stack" key={item.node_id}>
+                <div className="row-between">
+                  <h3>
+                    {item.node_index}/{item.node_total} · {item.node_title}
+                  </h3>
+                  <span className="badge badge-node badge-mastered">已掌握</span>
+                </div>
+                <p className="muted small">
+                  到期 {formatTime(item.due_at)} · 当前间隔 {item.interval_days} 天
+                </p>
+                <div className="btn-row">
+                  {turn?.node?.id === item.node_id && isAwaitingAnswer ? (
+                    <span className="muted small">正在复习这个节点</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-primary"
+                      disabled={busy || isAwaitingAnswer}
+                      onClick={() => void startReview(item.node_id)}
+                    >
+                      开始复习
+                    </button>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       <section className="stack" aria-label="待复习薄弱点">
         <div className="row-between">
           <h2>待复习薄弱点</h2>

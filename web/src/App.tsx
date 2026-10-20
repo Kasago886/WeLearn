@@ -1,11 +1,13 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 
+import { AuthPrompt } from './components/AuthPrompt'
 import { ArchivePage } from './pages/ArchivePage'
 import { AssessmentPage } from './pages/AssessmentPage'
 import { NewSubjectPage } from './pages/NewSubjectPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { PathPage } from './pages/PathPage'
 import { ReviewPage } from './pages/ReviewPage'
+import { SearchPage } from './pages/SearchPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StageRedirect } from './pages/StageRedirect'
 import { SubjectLayout } from './pages/SubjectLayout'
@@ -24,6 +26,9 @@ export default function App() {
           <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}>
             学习主题
           </NavLink>
+          <NavLink to="/search" className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}>
+            检索
+          </NavLink>
           <NavLink to="/settings" className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}>
             设置
           </NavLink>
@@ -34,6 +39,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<SubjectsPage />} />
           <Route path="/new" element={<NewSubjectPage />} />
+          <Route path="/search" element={<SearchPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/subjects/:subjectId" element={<SubjectLayout />}>
             {/* 刷新恢复：由状态机决定该落在哪一步（FR-410） */}
@@ -47,6 +53,7 @@ export default function App() {
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
+      <AuthPrompt />
     </div>
   )
 }

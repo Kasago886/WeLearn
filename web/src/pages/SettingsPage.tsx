@@ -3,8 +3,10 @@ import { useEffect, useState } from 'react'
 import { errorMessage } from '../api/client'
 import { settingsApi } from '../api/endpoints'
 import type {
+  Balance,
   EffortPick,
   LlmPurposeKey,
+  LogStats,
   ModelInfo,
   ModelPick,
   PurposeOverride,
@@ -202,6 +204,12 @@ export function SettingsPage() {
   const [testModel, setTestModel] = useState('')
   const [testResult, setTestResult] = useState<TestConnectionResult | null>(null)
   const [usage, setUsage] = useState<UsageSummary | null>(null)
+  // 口令是"写一次、之后只回是否启用"，因此草稿与设置快照分开存：
+  // null 表示本次不改（服务端保持现状），"" 表示清除，其它值表示设为新口令。
+  const [tokenDraft, setTokenDraft] = useState<string | null>(null)
+  const [tokenMessage, setTokenMessage] = useState<string | null>(null)
+  const [balance, setBalance] = useState<Balance | null>(null)
+  const [logStats, setLogStats] = useState<LogStats | null>(null)
 
   const { data, error, loading, reload } = useResource(() => settingsApi.get(), [])
   const models = useResource(() => settingsApi.models(), [])
@@ -217,6 +225,10 @@ export function SettingsPage() {
       .usage()
       .then(setUsage)
       .catch(() => setUsage(null))
+    void settingsApi
+      .logs()
+      .then(setLogStats)
+      .catch(() => setLogStats(null))
   }, [])
 
   if (loading) return <Spinner label="正在加载设置…" />
@@ -247,12 +259,19 @@ export function SettingsPage() {
     delete (payload as Partial<Settings>).api_key
     // model_plan 是后端解析出的只读视图，提交回去没有意义
     delete (payload as Partial<Settings>).model_plan
+    delete (payload as Partial<Settings>).access_token_enabled
+    // 口令采用三态：没动过就不带这个字段，避免"改别的设置顺手清掉口令"
+    if (tokenDraft !== null) {
+      ;(payload as Record<string, unknown>).access_token = tokenDraft
+    }
 
     void settingsApi
       .save(payload as unknown as Record<string, unknown>)
       .then((body) => {
         setDraft(body.settings)
         setSaved('设置已保存并立即生效。')
+        setTokenDraft(null)
+        setTokenMessage(null)
       })
       .catch((cause: unknown) => setProblem(errorMessage(cause)))
       .finally(() => setBusy(false))
@@ -654,6 +673,16 @@ export function SettingsPage() {
             onChange={(value) => patch({ node_max_retries: value })}
           />
           <NumberField
+            id="review_interval_days"
+            label="久未复习提醒（天）"
+            hint="已掌握节点超过这么多天没触达，就在主题列表标『建议复习』"
+            value={draft.review_interval_days}
+            min={1}
+            max={365}
+            disabled={busy}
+            onChange={(value) => patch({ review_interval_days: value })}
+          />
+          <NumberField
             id="compress_threshold_rounds"
             label="压缩触发轮数"
             value={draft.compress_threshold_rounds}
@@ -670,6 +699,110 @@ export function SettingsPage() {
             onChange={(value) => patch({ compress_round_count: value })}
           />
         </div>
+
+        <div className="field">
+          <label htmlFor="tools" style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
+            <input
+              id="tools"
+              type="checkbox"
+              style={{ width: 'auto' }}
+              checked={draft.tools_enabled}
+              disabled={busy}
+              onChange={(event) => patch({ tools_enabled: event.target.checked })}
+            />
+            允许教学时调用工具（读取档案 / 写笔记 / 记录薄弱点）
+          </label>
+          <span className="hint">
+            开启后模型可以在讲解过程中查看你的档案、替你记笔记（FR-714）。代价是历史思维链必须回传，
+            上下文与费用都会上升；关掉后行为与以前完全一致。思考模式下官方不支持强制工具调用，
+            因此这里只提供工具，不强制模型使用。
+          </span>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>成本估算与余额</h2>
+        <p className="muted small">
+          单价单位是「元 / 百万 token」，填的是**高峰价**；空闲时段（工作日 9:00–12:00、14:00–18:00
+          之外，含周末）官方按半价计费，估算会自动打折（FR-706）。
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>缓存命中输入</th>
+              <th>未命中输入</th>
+              <th>输出</th>
+            </tr>
+          </thead>
+          <tbody>
+            {Object.entries(draft.price_table).map(([model, prices]) => (
+              <tr key={model}>
+                <td>{model}</td>
+                {(['cache_hit', 'cache_miss', 'output'] as const).map((key) => (
+                  <td key={key}>
+                    <input
+                      aria-label={`${model} 的 ${key} 单价`}
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      disabled={busy}
+                      value={prices[key] ?? 0}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        patch({
+                          price_table: {
+                            ...draft.price_table,
+                            [model]: { ...prices, [key]: Number.isFinite(value) ? value : 0 },
+                          },
+                        })
+                      }}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="muted small">
+          已累计估算 {usage?.cost ? `${usage.cost.currency} ${usage.cost.amount.toFixed(4)}` : '—'}
+          {usage?.cost
+            ? `（高峰 ${usage.cost.peak_tokens.toLocaleString('zh-CN')} / 空闲 ${usage.cost.off_peak_tokens.toLocaleString(
+                'zh-CN',
+              )} token）`
+            : ''}
+        </p>
+
+        <div className="row-between">
+          <div>
+            <strong className="small">账户余额</strong>
+            <p className="muted small" style={{ margin: 0 }}>
+              需要已配置 API Key；查询失败不会影响学习功能（FR-710）。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true)
+              void settingsApi
+                .balance()
+                .then(setBalance)
+                .catch(() => setBalance({ ok: false, currency: null, total_balance: null, granted_balance: null, topped_up_balance: null, message: '余额查询失败。' }))
+                .finally(() => setBusy(false))
+            }}
+          >
+            查询余额
+          </button>
+        </div>
+        {balance ? (
+          <p className={balance.ok ? 'small' : 'small'} style={{ color: balance.ok ? undefined : 'var(--danger)' }}>
+            {balance.ok
+              ? `${balance.currency ?? ''} 总余额 ${balance.total_balance ?? '—'}（赠金 ${balance.granted_balance ?? '—'} / 充值 ${balance.topped_up_balance ?? '—'}）`
+              : balance.message || '余额查询失败。'}
+          </p>
+        ) : null}
       </div>
 
       <div className="card">
@@ -697,6 +830,91 @@ export function SettingsPage() {
               : `${usage.calls} 次调用 · 输入 ${usage.prompt_tokens} / 输出 ${usage.completion_tokens} token · 推理 ${usage.reasoning_tokens} · 缓存命中率 ${(
                   usage.cache_hit_rate * 100
                 ).toFixed(1)}% · 累计耗时 ${formatDuration(usage.duration_ms)}`}
+          </dd>
+          <dt>日志轮转</dt>
+          <dd>
+            单个文件超过
+            <input
+              aria-label="日志单文件上限（MB）"
+              type="number"
+              min={1}
+              max={100}
+              disabled={busy}
+              value={draft.log_max_mb}
+              onChange={(event) => patch({ log_max_mb: Number(event.target.value) })}
+              style={{ width: 80, margin: '0 6px' }}
+            />
+            MB 时轮转，归档保留
+            <input
+              aria-label="日志保留天数"
+              type="number"
+              min={1}
+              max={365}
+              disabled={busy}
+              value={draft.log_retention_days}
+              onChange={(event) => patch({ log_retention_days: Number(event.target.value) })}
+              style={{ width: 80, margin: '0 6px' }}
+            />
+            天（FR-907）
+          </dd>
+          <dt>日志占用</dt>
+          <dd>
+            {logStats === null
+              ? '（读取失败）'
+              : `${(logStats.total_bytes / 1024).toFixed(1)} KB · ${logStats.files.length} 个文件`}
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{ marginLeft: 8 }}
+              disabled={busy}
+              onClick={() => {
+                if (!window.confirm('确定清理日志吗？当前日志会被清空，归档会被删除。')) return
+                setBusy(true)
+                void settingsApi
+                  .cleanLogs()
+                  .then(() => settingsApi.logs())
+                  .then(setLogStats)
+                  .catch((cause: unknown) => setProblem(errorMessage(cause)))
+                  .finally(() => setBusy(false))
+              }}
+            >
+              清理日志
+            </button>
+          </dd>
+          <dt>访问口令</dt>
+          <dd>
+            {draft.access_token_enabled ? (
+              <span className="small">
+                已启用（口令本身不会显示）
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger"
+                  style={{ marginLeft: 8 }}
+                  disabled={busy}
+                  onClick={() => {
+                    if (!window.confirm('确定清除访问口令吗？清除后本机任何人都能打开这个实例。')) return
+                    setTokenDraft('')
+                    setTokenMessage('已标记为清除，点击右上角「保存设置」生效。')
+                  }}
+                >
+                  清除口令
+                </button>
+              </span>
+            ) : (
+              <span className="small">
+                <input
+                  aria-label="设置访问口令"
+                  type="password"
+                  placeholder="留空表示不设置"
+                  value={tokenDraft ?? ''}
+                  disabled={busy}
+                  onChange={(event) => setTokenDraft(event.target.value)}
+                  style={{ width: 200, marginRight: 8 }}
+                />
+                设置后所有学习数据接口都需要口令（FR-903）
+              </span>
+            )}
+            {tokenMessage ? <p className="small muted">{tokenMessage}</p> : null}
           </dd>
         </dl>
 

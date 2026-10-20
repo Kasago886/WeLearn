@@ -8,6 +8,7 @@ import { Banner, Spinner } from '../components/Banner'
 import { NodeHistoryPanel } from '../components/NodeHistoryPanel'
 import { NodeStateBadge } from '../components/StatusBadge'
 import { useResource } from '../hooks/useResource'
+import { downloadText } from '../utils/download'
 
 const WEAK_REASON_LABELS: Record<string, string> = {
   partial: '部分掌握',
@@ -230,6 +231,31 @@ export function ArchivePage() {
           </p>
         </div>
         <div className="btn-row">
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={problem !== null}
+            onClick={() => {
+              void subjectsApi
+                .exportData(subjectId, 'markdown')
+                .then((body) => downloadText(body.filename, body.content, 'text/markdown'))
+                .catch((cause: unknown) => setProblem(errorMessage(cause)))
+            }}
+          >
+            导出 Markdown
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => {
+              void subjectsApi
+                .exportData(subjectId, 'json')
+                .then((body) => downloadText(body.filename, body.content, 'application/json'))
+                .catch((cause: unknown) => setProblem(errorMessage(cause)))
+            }}
+          >
+            导出 JSON 备份
+          </button>
           <Link className="btn btn-sm" to={`/subjects/${subjectId}/review`}>
             薄弱点复习
           </Link>
@@ -316,6 +342,16 @@ export function ArchivePage() {
           )
         ) : (
           <>
+            <dl className="detail-list">
+              <dt>本主题成本估算</dt>
+              <dd>
+                {summary.usage.cost
+                  ? `${summary.usage.cost.currency} ${summary.usage.cost.amount.toFixed(4)}（高峰 ${summary.usage.cost.peak_tokens.toLocaleString(
+                      'zh-CN',
+                    )} / 空闲 ${summary.usage.cost.off_peak_tokens.toLocaleString('zh-CN')} token）`
+                  : '—'}
+              </dd>
+            </dl>
             <div className="form-grid">
               <ReportList title="已掌握" entries={summary.mastered} emptyText="还没有已掌握的节点。" />
               <ReportList

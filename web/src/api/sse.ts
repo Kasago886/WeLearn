@@ -6,7 +6,7 @@
  * 顺带拿到了 EventSource 没有的能力——用 AbortController 真正中断请求。
  */
 
-import { ApiError, isAborted } from './client'
+import { ApiError, authHeaders, isAborted } from './client'
 import type { SseEvent, SseEventType } from './types'
 
 export interface TurnHandlers {
@@ -62,7 +62,11 @@ export async function streamTurn(
   try {
     response = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+        ...authHeaders(),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
     })

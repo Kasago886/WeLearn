@@ -44,6 +44,10 @@ export interface SubjectListItem extends Subject {
   progress: Progress
   last_studied_at: string | null
   duplicate_title_hint: boolean
+  /** 已到期的复习节点数（FR-506）。 */
+  due_reviews?: number
+  /** 有掌握节点久未触达或有到期排期，列表上标「建议复习」（FR-505）。 */
+  needs_review?: boolean
 }
 
 export interface Checkpoint {
@@ -163,6 +167,19 @@ export interface ReviewOverview {
   node_total: number
   mastered_count: number
   current: ReviewTurn | null
+  /** 到期的已掌握节点（FR-506 的"当日复习清单"）。 */
+  due: DueReview[]
+  due_count: number
+}
+
+/** 到期复习项：只带展示需要的信息，不把整条路径塞进列表。 */
+export interface DueReview {
+  node_id: string
+  node_title: string
+  node_index: number
+  node_total: number
+  due_at: string | null
+  interval_days: number
 }
 
 export interface NodeHistory {
@@ -226,9 +243,56 @@ export interface CompletionReport {
     cache_hit_rate: number
     /** 累计模型调用耗时（毫秒），不含用户阅读时间（FR-417）。 */
     duration_ms: number
+    /** 成本估算（FR-706）。 */
+    cost?: CostSummary
   }
   started_at: string | null
   last_activity_at: string | null
+}
+
+/** 全局检索的结果（FR-803）。三类来源分开返回，便于各自展示与跳转。 */
+export interface SearchNoteHit {
+  subject_id: string
+  subject_title: string
+  node_id: string
+  node_title: string
+  snippet: string
+  updated_at: string | null
+}
+
+export interface SearchAnswerHit {
+  subject_id: string
+  subject_title: string
+  node_id: string
+  node_title: string
+  verdict: Verdict
+  snippet: string
+  created_at: string | null
+  source: 'teach' | 'review'
+}
+
+export interface SearchMessageHit {
+  subject_id: string
+  subject_title: string
+  conversation_kind: 'assess' | 'teach' | 'review'
+  role: string
+  snippet: string
+  created_at: string | null
+}
+
+export interface SearchResult {
+  query: string
+  total: number
+  notes: SearchNoteHit[]
+  answers: SearchAnswerHit[]
+  messages: SearchMessageHit[]
+}
+
+/** 导出结果：前端用 Blob 下载，不依赖后端设 Content-Disposition。 */
+export interface ExportPayload {
+  filename: string
+  content: string
+  format: 'markdown' | 'json'
 }
 
 /** `GET /subjects/{id}/state`：刷新后唯一的恢复入口。 */
@@ -307,6 +371,17 @@ export interface Settings {
   max_tokens: number
   timeout_seconds: number
   max_retries: number
+  /** 久未复习的提醒阈值（FR-505），单位天。 */
+  review_interval_days: number
+  /** 单个日志文件的轮转阈值（MB）与归档保留天数（FR-907）。 */
+  log_max_mb: number
+  log_retention_days: number
+  /** 工具调用开关（FR-714）；开启后历史思维链会回传，上下文与费用都会上升。 */
+  tools_enabled: boolean
+  /** 生效价表（元 / 百万 token，高峰价）；保存时整体替换。 */
+  price_table: Record<string, Record<string, number>>
+  /** 是否已设置访问口令（FR-903）；口令本身永不回传。 */
+  access_token_enabled: boolean
   /** 采样温度（FR-718）：思考模式下官方会忽略它。 */
   temperature: number
   /** 核采样（FR-718）：仅思考模式下生效，且被钳制到 0.95~1.0。 */
@@ -368,6 +443,40 @@ export interface UsageSummary extends UsageBucket {
   by_subject?: SubjectUsageBucket[]
   /** 命中率异常时的排查提示；正常时为 null（FR-705、FR-720）。 */
   cache_hint?: string | null
+  /** 成本估算（FR-706）。 */
+  cost?: CostSummary
+}
+
+/** 费用估算：金额单位由 currency 决定（默认人民币元）。 */
+export interface CostSummary {
+  amount: number
+  currency: string
+  peak_tokens: number
+  off_peak_tokens: number
+  total_tokens: number
+}
+
+export interface Balance {
+  ok: boolean
+  currency: string | null
+  total_balance: string | null
+  granted_balance: string | null
+  topped_up_balance: string | null
+  message: string
+  category?: string | null
+}
+
+export interface LogStats {
+  log_dir: string
+  files: { name: string; size: number }[]
+  total_bytes: number
+  max_bytes: number
+  retention_days: number
+}
+
+export interface AuthVerify {
+  ok: boolean
+  required: boolean
 }
 
 export interface Health {

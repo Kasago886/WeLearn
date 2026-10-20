@@ -8,15 +8,20 @@ import { api } from './client'
 import type {
   ArchiveView,
   AssessmentView,
+  AuthVerify,
+  Balance,
   CompletionReport,
+  ExportPayload,
   Health,
   LearningPath,
+  LogStats,
   ModelInfo,
   NodeHistory,
   PathView,
   Progress,
   ReviewOverview,
   ReviewTurn,
+  SearchResult,
   Settings,
   StudyNote,
   Subject,
@@ -59,6 +64,10 @@ export const subjectsApi = {
     api.put<{ note: StudyNote }>(`/api/subjects/${id}/nodes/${nodeId}/note`, { content }),
   archiveOverview: (id: string) => api.get<ArchiveView>(`/api/subjects/${id}/archive`),
   completionReport: (id: string) => api.get<CompletionReport>(`/api/subjects/${id}/report`),
+  exportData: (id: string, format: 'markdown' | 'json') =>
+    api.get<ExportPayload>(`/api/subjects/${id}/export?format=${format}`),
+  importData: (payload: unknown) =>
+    api.post<{ subject_id: string; title: string }>('/api/subjects/import', payload),
   assessment: (id: string) => api.get<AssessmentView>(`/api/subjects/${id}/assessment`),
   path: (id: string) => api.get<PathView>(`/api/subjects/${id}/path`),
   confirmPath: (id: string) => api.post<{ state: string }>(`/api/subjects/${id}/path/confirm`),
@@ -109,6 +118,16 @@ export const assessmentApi = {
     api.post<{ regenerate_path: boolean }>(`/api/subjects/${id}/assessment/level`, { topic, level }),
 }
 
+export const searchApi = {
+  search: (query: string, subjectId?: string, limit = 20) => {
+    const params = new URLSearchParams({ q: query, limit: String(limit) })
+    if (subjectId) {
+      params.set('subject_id', subjectId)
+    }
+    return api.get<SearchResult>(`/api/search?${params.toString()}`)
+  },
+}
+
 export const settingsApi = {
   get: () => api.get<{ settings: Settings }>('/api/settings'),
   save: (payload: Record<string, unknown>) => api.put<{ settings: Settings }>('/api/settings', payload),
@@ -121,4 +140,8 @@ export const settingsApi = {
   models: () => api.get<{ ok: boolean; message: string; items: ModelInfo[] }>('/api/models'),
   usage: () => api.get<UsageSummary>('/api/usage'),
   health: () => api.get<Health>('/api/health'),
+  verifyToken: () => api.get<AuthVerify>('/api/auth/verify'),
+  balance: () => api.get<Balance>('/api/balance'),
+  logs: () => api.get<LogStats>('/api/logs'),
+  cleanLogs: () => api.post<{ removed_files: number; freed_bytes: number }>('/api/logs/clean'),
 }
