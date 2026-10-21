@@ -30,7 +30,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import BlockingResult, StreamEvent, ToolCall, TokenUsage
+from app.infra.deepseek.protocol import BlockingResult, StreamEvent, TokenUsage, ToolCall
 from app.main import create_app
 from app.services.learning.stack import build_learning_stack
 
