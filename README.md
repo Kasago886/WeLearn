@@ -1,152 +1,270 @@
 # WeLearn
 
-个性化概念学习 Web 应用：用户指定要学习的概念，系统先确认知识基础，再生成个性化学习路径，最后按路径逐节点进行问答式教学（每个节点通过检查点提问确认掌握后才继续）。
+一个自托管的个性化概念学习 Web 应用：你说出想学的**概念**，它先摸清你的基础，再排出一条学习路径，
+然后逐个节点讲解、提问，**确认你真的会了才继续**。
 
-- 需求规格：[docs/需求规格说明书.md](docs/需求规格说明书.md)
-- 实施计划（当前现状与剩余规划）：[docs/实施计划.md](docs/实施计划.md)
-- 实施记录（各阶段历史与交付证据）：[docs/实施记录.md](docs/实施记录.md)
-- 接口契约（当前有效）：[docs/接口契约.md](docs/接口契约.md)
-- 契约变更记录（版本演进与实测结论）：[docs/接口契约变更记录.md](docs/接口契约变更记录.md)
-- Spike 实测：[docs/Spike实测结果.md](docs/Spike实测结果.md)
-- 设计参考：[ReferenceCode/](ReferenceCode)（C# 实现，仅作参考，不作依赖）
+- 单用户自用，数据全部留在你自己的机器上（SQLite 文件 + 日志）
+- 只需要一个 DeepSeek API Key；模型、参数、价格都能在界面里调
+- 一条命令启动，不需要单独部署前端，也不需要数据库服务
 
-## 环境准备
+---
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item .env.example .env   # 填写 WELEARN_API_KEY
-```
+## 它是怎么教的
 
-## 运行
-
-后端启动后**同时提供前端页面**（`web/dist` 由后端托管），不需要另起前端进程：
-
-```powershell
-cd web; npm run build; cd ..        # 只需一次，或前端有改动后重跑
-.\.venv\Scripts\python.exe -m app.main
-# 浏览器打开 http://127.0.0.1:8000
-```
-
-开发期仍推荐前后端分离（vite 有 HMR）：见下面「前端（web/）」一节。
-没有 `web/dist` 时后端照常提供接口，只是访问 `/` 会 404——开发期前端走 vite 就是这个状态。
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:create_app --factory --reload
-```
-
-健康检查：`GET http://127.0.0.1:8000/api/health`
-
-### 环境变量
-
-| 变量 | 默认值 | 说明 |
+| 步骤 | 你做什么 | 它做什么 |
 | --- | --- | --- |
-| `WELEARN_HOST` / `WELEARN_PORT` | `127.0.0.1` / `8000` | 监听地址与端口 |
-| `WELEARN_DATA_DIR` | `./data` | 数据目录（SQLite、日志、备份），**整目录复制即可搬迁** |
-| `WELEARN_WEB_DIST` | `<仓库>/web/dist` | 前端产物位置，仅在自定义打包布局时需要 |
+| 1. 知识基础确认 | 回答几轮问题（也可以跳过） | 判断你在各子领域的水平，给出结构化画像 |
+| 2. 学习路径 | 看一眼，可改可调顺序 | 按你的画像排出 3~15 个节点，每个节点带目标、要点与检查点问题 |
+| 3. 逐节点教学 | 听讲解，然后用自己的话回答检查点问题 | 讲解 → 提问 → 独立判定 → 没讲透就换角度重讲 |
+| 4. 复习 | 从薄弱点或到期节点里挑一个，重新作答 | 复用原检查点提问，通过就把薄弱点补上 |
+| 5. 档案 | 回看笔记与作答记录，导出报告 | 汇总进度、用量、成本，逐节点留档 |
 
-密钥、模型、访问口令等业务配置都在**设置页**里改（存进数据库），不放环境变量；
-`.env` 只用于首次配置 `WELEARN_API_KEY`。
+设计上只有一条硬规则：**检查点没过就不自动前进**。答不上来时它会降级提示、换例子、换角度重讲；
+多次仍不通，由**你**决定继续重讲、看参考答案，还是直接进入下一个节点（会记入薄弱点，之后可复习补上）。
 
-## 部署（Docker）
+---
+
+## 安装
+
+任选一种。两种方式的数据都放在同一个目录里，随时可以互转。
+
+### 方式一：Docker（推荐，不需要装 Python / Node）
+
+需要 Docker Desktop（Windows / macOS）或 Docker Engine + Compose v2（Linux）。
 
 ```bash
-docker compose up -d --build      # 首次或改代码后
-docker compose logs -f welearn    # 看日志
-docker compose down               # 停止；数据在 ./data，不随容器消失
+# 在仓库根目录
+docker compose up -d --build
+docker compose logs -f welearn     # 看启动日志，Ctrl+C 退出查看
 ```
 
-- 镜像分两阶段构建：`node:22` 编前端 → `python:3.12-slim` 跑后端，用户机器不需要装 Node。
-- 进程以非 root（uid 10001）运行，`./data` 用 bind mount 挂进 `/data`，便于直接备份与升级。
-- 默认只绑定 `127.0.0.1:8000`；要从别的机器访问，设 `WELEARN_BIND=0.0.0.0` 并**同时**在设置页配置访问口令。
-- Linux 上若 `./data` 不属于 uid 10001，容器会以只读权限启动失败：先 `sudo chown -R 10001:10001 ./data`（Docker Desktop 不需要）。
-- `env_file: .env` 声明为可选（需要 Compose ≥ 2.24）：没有 `.env` 也能启动，只是首次得在设置页填 Key。
+打开 <http://127.0.0.1:8000> 即可。停止用 `docker compose down`——
+**数据在 `./data`，不会随容器消失**。
 
-## 备份与恢复
+### 方式二：本机直接跑
+
+需要 Python 3.11+；构建前端还需要 Node 20.19+ 或 22+（只需构建一次）。
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\backup_db.py backup            # 备份到 <数据目录>/backups/welearn-<时间戳>.db
-.\.venv\Scripts\python.exe scripts\backup_db.py verify            # 校验最新备份（也可 --file 指定）
-.\.venv\Scripts\python.exe scripts\backup_db.py restore --file <备份文件>
+# Windows PowerShell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+cd web; npm ci; npm run build; cd ..
+.\.venv\Scripts\python.exe -m app.main
 ```
 
-服务运行中也能备份：用的是 SQLite 在线备份 API，拿到的是包含 WAL 已提交内容的一致视图
-（直接复制 `welearn.db` 会丢掉最近提交的数据）。恢复前会把原库改名留档为
-`welearn.db.before-restore-<时间戳>`，备份校验不过则拒绝覆盖。
-
-升级迁移不需要额外操作：新版本启动时按 `SCHEMA_VERSION` 自动做幂等列级升级，老库原地升到最新版本。
-
-## 前端（web/）
-
-React 19 + Vite + TypeScript，不依赖 UI 组件库；按页面拆分为主题 / 测评 / 路径 / 教学 / 设置。
-
-```powershell
-cd web
-npm install
-npm run dev          # 开发服务器 http://localhost:5173，/api 自动代理到 127.0.0.1:8000
-npm run build        # tsc -b && vite build
-npm run lint         # oxlint
+```bash
+# macOS / Linux
+python3 -m venv .venv
+./.venv/bin/python -m pip install .
+cd web && npm ci && npm run build && cd ..
+./.venv/bin/python -m app.main
 ```
 
-后端未启动时前端会给出"无法连接到后端服务"的可操作提示，而不是白屏。
+打开 <http://127.0.0.1:8000>。升级时重跑最后两步（`pip install .` + `npm run build`）即可，
+数据库会自动迁移到新版本。
 
-### 不开真实额度也能联调
+---
 
-`scripts/dev_stub_server.py` 用假 LLM 起一个**真实**服务端，让整条链路
-（SSE 分帧、事件处理、三选一、刷新恢复）可以零成本反复跑：
+## 首次配置：填 API Key
 
-```powershell
-# 终端 1
-.\.venv\Scripts\python.exe scripts\dev_stub_server.py
-# 终端 2
-cd web; npm run dev
+**推荐在界面里填**：打开 <http://127.0.0.1:8000> → 右上角「设置」→「模型与 API Key」→
+粘贴 Key → 点「保存」→ 再点「测试连接」确认可用。
+
+也可以写进 `.env`（环境变量优先级高于界面设置）：把 `.env.example` 复制成 `.env`，填入 `WELEARN_API_KEY`。
+
+> Key 以 Fernet 加密后保存在本地数据库里，界面上只回显掩码（`sk-…abcd`），
+> 接口响应与日志都不会出现明文。加密密钥默认自动生成在数据目录下的 `secret.key`，
+> 想固定下来就设置 `WELEARN_SECRET_KEY`——**换了它，已保存的 Key 就解不开了**
+> （界面会提示未配置 Key，重新录入一次即可）。
+
+其他常用配置（界面上都能改，改完立即生效）：
+
+| 想调整 | 去哪 |
+| --- | --- |
+| 用哪个模型、思考档位开多高 | 设置 → 按用途的模型与思考参数 |
+| 路径节点数量、测评轮次上限、重讲上限 | 设置 → 学习流程 |
+| 单价（用于成本估算） | 设置 → 成本估算与余额 |
+| 日志大小与保留天数、访问口令 | 设置 → 运行与数据 |
+
+---
+
+## 开始使用
+
+### 1. 新建学习主题
+
+点「新建学习主题」，填概念名称（必填），其余选填：
+
+- **学习目标**：例如「能在面试里讲清楚」——会直接影响讲解的侧重
+- **期望深度**：入门了解 / 系统掌握 / 深入原理
+- **已有背景**：写得越具体，测评与讲解越贴合你
+
+> 写具体概念比写大领域好教：「贝叶斯定理」优于「概率论」。
+
+想跳过测评就直接点「跳过测评，直接生成路径」。这不是省略步骤，而是明确按**零基础**处理，
+路径页与画像都会带上「未进行测评」的前提。
+
+### 2. 知识基础确认
+
+它一次问一个问题，你按自己的理解答。答满轮次上限（默认 6 轮）后自动产出画像，
+显示各子领域的水平与判断依据。
+
+- 觉得判得不准？直接在下拉里改，改完会提示「需重新生成路径」
+- 想看它凭什么这么判？展开「测评过程回顾」
+
+### 3. 学习路径
+
+自动生成后先给你看，**确认后**才开始学习：
+
+- 每个节点有目标、要点、检查点数量
+- 可编辑标题/目标/要点、插入节点、删除、上下移动、单独重生成某个节点、整条重新生成
+- 已经开始的节点不允许改结构（避免学到一半路径变形）
+- 每次重生成都保留历史版本，档案页能看到当前用的是第几版
+
+### 4. 教学
+
+- 点「开始学习」→ 它讲解本节点并提一个检查点问题 → 你作答 → 它独立判定（通过 / 部分通过 / 未通过）
+- 没通过会换角度重讲再问；**通过才出现「进入下一个节点」**
+- 卡住时可用：「提示」（连续失败会自动升档：方向 → 关键点 → 接近答案）、「穿插提问」（随时问个相关问题，不影响进度）、「重新生成这条回复」
+- 多次仍不通，它会停下来给你三个选项：继续换角度重讲 / 查看参考答案 / 直接进入下一个节点
+- 随时可「暂停」或「跳过本节点」；跳过会记入薄弱点，之后可以复习补上
+
+### 5. 薄弱点与复习
+
+「薄弱点复习」页有两个清单：
+
+- **今日复习**：已掌握的节点按间隔排期（1/3/7/21/60 天）到期后出现在这里，久未复习的会在主题列表提示
+- **待复习薄弱点**：曾经跳过、答错后放行、或只部分掌握的节点
+
+点进去直接作答，**通过就把这个薄弱点补上**，节点升级为已掌握。复习用的是节点原来的检查点，
+不会额外花一次模型调用去出题。
+
+### 6. 学习档案
+
+每个主题都有独立档案页：
+
+- 整体进度、路径版本、累计 token、累计模型耗时、学习跨度
+- 逐节点笔记（自动小结与手写分开标注，随时可改）+ 完整作答历史（区分教学与复习）
+- 完成全部节点后出现完成报告：已掌握 / 部分掌握（含原因）/ 已跳过、薄弱点、成本估算
+- 「导出 Markdown」写学习报告，「导出 JSON 备份」可再导入回来
+
+### 其他
+
+- **全局检索**（顶部导航）：一次搜笔记、作答记录、历史对话
+- **导入**：主题列表页「导入主题备份」，选一个导出的 JSON，会作为新主题还原
+- **归档 / 删除**：列表页每个主题都有；归档只是收起来，删除会连同路径、笔记、作答、记忆一起清掉
+
+---
+
+## 数据、备份与升级
+
+### 数据放在哪
+
+| 位置 | 内容 |
+| --- | --- |
+| `./data/welearn.db` | 全部业务数据（主题、路径、笔记、作答、记忆、设置、加密后的 Key） |
+| `./data/logs/` | 应用日志与模型调用日志（按大小轮转，默认 5MB、保留 14 天） |
+| `./data/backups/` | 备份文件 |
+| `./data/secret.key` | 加密 Key 用的密钥（未显式配置 `WELEARN_SECRET_KEY` 时自动生成） |
+
+想换位置就设 `WELEARN_DATA_DIR`；**搬迁或升级时整个目录一起复制**即可。
+
+### 备份
+
+```bash
+# Docker
+docker compose exec welearn python scripts/backup_db.py backup
+
+# 本机
+.\.venv\Scripts\python.exe scripts\backup_db.py backup
 ```
 
-桩的判定规则是"回答 ≥40 字算通过"，因此可以手动制造
-"未通过 → 换角度重讲 → 重试耗尽 → 三选一"的完整路径。
+备份落在 `data/backups/welearn-<时间戳>.db`。**服务运行中也能备份**——用的是 SQLite 在线备份 API，
+拿到的是包含最近提交的一致快照；直接复制 `welearn.db` 会丢掉还没落盘的最新数据。
 
-## 校验
+顺带两条子命令（Windows 本机把 `python` 换成 `.\.venv\Scripts\python.exe`）：
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m mypy app scripts
-cd web; npm run build; npm run lint
+```bash
+python scripts/backup_db.py verify                     # 校验最新备份（也可 --file 指定）
+python scripts/backup_db.py restore --file <备份文件>   # 恢复
 ```
 
-性能校验（真实 uvicorn + 假 LLM，不消耗额度；结果只反映本机瓶颈）：
+**恢复前先停掉服务**：脚本会探测写锁，服务还在跑时会直接拒绝（而不是写坏数据）。
+恢复时原库会改名为 `welearn.db.before-restore-<时间戳>` 留档；备份校验不过则拒绝覆盖。
 
-```powershell
-.\.venv\Scripts\python.exe scripts\perf_check.py
+### 升级
+
+- Docker：`docker compose up -d --build`
+- 本机：重新 `pip install .` + `npm run build`，然后重启
+
+数据库在启动时按版本号自动做幂等升级，老库原地升到最新版本，不需要手工迁移。
+升级前建议先做一次备份。
+
+---
+
+## 从其他设备访问
+
+默认**只监听 127.0.0.1**，也就是只有本机能打开。要从手机或另一台电脑访问：
+
+1. 让服务监听所有网卡：Docker 设 `WELEARN_BIND=0.0.0.0`（本机直接运行时设 `WELEARN_HOST=0.0.0.0`）
+2. **务必同时**在「设置 → 运行与数据」里设置**访问口令**
+
+设了口令后，除健康检查与口令探测这两个接口外，其余接口都要求口令，浏览器会弹出一个很小的输入层。
+
+> 这是单用户应用，没有账号体系。只要把端口暴露到局域网/公网又不设口令，就等于把学习数据和
+> API Key 的使用权一起交出去。若需跨公网访问，请放在反向代理与 TLS 之后。
+
+---
+
+## 常见问题
+
+**打开 `http://127.0.0.1:8000` 是 404 或一片空白**
+前端没有构建。本机运行时先执行 `cd web && npm ci && npm run build`，随后端启动会自动托管它。
+只有接口、没有页面的状态（访问 `/` 返回 404、`/api/health` 正常）就是这种情况。
+
+**提示「未配置 API Key」**
+去设置页填入 Key 并保存，然后点「测试连接」。也可以写进 `.env` 的 `WELEARN_API_KEY`。
+
+**一直弹口令框 / 提示需要访问口令**
+这个实例设置过口令。输入正确口令即可；忘了就在能打开页面的设备上到「设置 → 运行与数据」清除它。
+
+**Docker 起来了但立刻退出，日志显示权限错误（Linux）**
+`./data` 的所有者不是容器内的 uid 10001：
+
+```bash
+sudo chown -R 10001:10001 ./data
 ```
 
-它报告首 token 延迟与本地接口（主题列表、状态快照、档案页、检索）的 p50/p95，
-与预算（NFR-101 首 token ≤ 3s、NFR-102 本地接口 ≤ 300ms）逐项对照。
+Docker Desktop（Windows / macOS）不需要这一步。
 
-## 真实 API 冒烟测试
+**端口 8000 被占用**
+Docker：改 `docker-compose.yml` 里 `ports` 的宿主机一侧，例如 `127.0.0.1:8080:8000`；
+本机直接运行：设 `WELEARN_PORT`。也可以先关掉占用它的程序。
 
-```powershell
-# 需要 .env 中已配置 WELEARN_API_KEY
-.\.venv\Scripts\python.exe scripts\llm_smoke.py
-# 附带录制响应样本，供离线回放（T0.7）
-.\.venv\Scripts\python.exe scripts\llm_smoke.py --record
-```
+**回答看起来被截断了**
+先点「重新生成这条回复」确认是模型侧截断还是网络中断。日志里若出现网络错误，
+多半是连接中途断开；已生成的内容会保留，可以直接重试。
 
-未配置 Key 时会给出引导并以退出码 2 退出（便于区分"没配密钥"与"接口故障"）。
-`--record` 会把真实 SSE 流、非流式响应、JSON Output 响应、模型列表与余额写入
-`tests/fixtures/llm/recorded/`；这些样本由 `tests/test_recorded_fixtures.py` 回放验证，
-并强制检查其中不含密钥。
+**想省钱**
+设置里打开「使用推荐组合」（路径规划与作答判定用深度模型、上下文压缩关思考），
+把「压缩触发轮数」调小让历史更早收敛，并在「成本估算与余额」里填入你实际的单价看真实花费。
+思考档位越高越贵，多数场景用默认（关思考）就够。
 
-## Spike 实测（真实额度）
+**余额查询失败**
+余额接口失败不会影响学习流程，多半是 Key 权限或网络问题；确认 Key 可用后再点「查询余额」。
 
-离线测试证明不了"官方多久返回一次空内容、判定器会不会放水、思考档位值不值"，
-这些要用真实调用抽样（结论见 [docs/Spike实测结果.md](docs/Spike实测结果.md)）：
+---
 
-```powershell
-# 全部跑一遍（约 30 次调用），或只跑其中一个
-.\.venv\Scripts\python.exe scripts\spike_real.py --out docs/Spike实测结果.md
-.\.venv\Scripts\python.exe scripts\spike_real.py --spike b
-```
+## 文档
 
-默认用设置里的 `model_default`（`deepseek-flash`）：Spike 要回答的是"默认配置下表现如何"，
-换个模型测出来的结论对默认用户没有意义。
+想了解产品与需求：
+
+- [需求规格说明书](docs/需求规格说明书.md)（含全部验收标准与证据对照）
+- [Spike 实测结果](docs/Spike实测结果.md)（真实额度下对模型行为的量化结论）
+
+准备改代码：
+
+- [开发指南](docs/开发指南.md)——环境、联调、调试、测试、分层约束与已知坑
+- [实施计划](docs/实施计划.md)（当前现状）、[实施记录](docs/实施记录.md)（历史与交付证据）
+- [接口契约](docs/接口契约.md)（当前有效）、[接口契约变更记录](docs/接口契约变更记录.md)（版本演进）
+- [ReferenceCode/](ReferenceCode)：设计参考（C# 实现，仅作参考，不作依赖）
