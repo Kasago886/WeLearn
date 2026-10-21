@@ -7,20 +7,25 @@
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import billing, exports, health, ops, search, settings, subjects
+from app.api.static_site import mount_frontend
 from app.infra.access import token_matches
 from app.main_context import AppContext, build_context
 from app.services.learning.stack import build_learning_stack
 
 ENV_HOST = "WELEARN_HOST"
 ENV_PORT = "WELEARN_PORT"
+ENV_WEB_DIST = "WELEARN_WEB_DIST"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+# 仓库内的构建产物默认位置；容器里由 Dockerfile 复制到同一相对位置
+DEFAULT_WEB_DIST = Path(__file__).resolve().parents[1] / "web" / "dist"
 
 
 def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
@@ -48,6 +53,8 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(subjects.router)
     app.include_router(settings.router)
+    # 必须放在所有 API 路由之后：兜底路由会吃掉未匹配的路径
+    mount_frontend(app, _frontend_dir(env))
 
     @app.middleware("http")
     async def guard_access_token(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -70,6 +77,13 @@ def create_app(env: Mapping[str, str] | None = None) -> FastAPI:
         return await call_next(request)
 
     return app
+
+
+def _frontend_dir(env: Mapping[str, str] | None) -> Path:
+    """前端产物目录。允许用环境变量覆盖，便于容器把静态资源放到别处。"""
+    source = env if env is not None else os.environ
+    configured = (source.get(ENV_WEB_DIST) or "").strip()
+    return Path(configured) if configured else DEFAULT_WEB_DIST
 
 
 def get_context(app: FastAPI) -> AppContext:

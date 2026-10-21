@@ -29,6 +29,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+# 提示词是 .md 模板而不是 Python 代码；不显式声明的话，`pip install` 出来的包会缺模板，
+# 表现为"装好了但一调用就报文件不存在"
+[tool.setuptools.package-data]
+"app.prompts" = ["*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -1,0 +1,45 @@
+# WeLearn 单机部署（D1~D3）
+#
+#   docker compose up -d --build      # 首次或改代码后
+#   docker compose logs -f welearn    # 看日志
+#   docker compose down               # 停止（数据在 ./data，不随容器消失）
+#
+# 数据目录用 bind mount 而不是命名卷：D3 要求"便于备份与升级"，
+# 用户可以随时把 ./data 整个复制走，也能直接看到 SQLite 与日志。
+# Linux 上若宿主目录不属于 uid 10001，容器会以只读权限失败——
+# 先 `sudo chown -R 10001:10001 ./data`（Windows/macOS 的 Docker Desktop 不需要）。
+
+name: welearn
+
+services:
+  welearn:
+    build:
+      context: .
+    image: welearn:0.1.0
+    container_name: welearn
+    ports:
+      # 默认只绑定回环地址：这是单用户自托管应用，不该无意中暴露到局域网。
+      # 需要从其它机器访问时，设置 WELEARN_BIND=0.0.0.0 并配合访问口令（FR-903）。
+      - "${WELEARN_BIND:-127.0.0.1}:8000:8000"
+    env_file:
+      # .env 不存在也能启动（会在健康检查里提示"未配置 API Key"），
+      # 因此这里声明为可选，避免"没配 Key 就连服务都起不来"。
+      - path: .env
+        required: false
+    environment:
+      WELEARN_DATA_DIR: /data
+      WELEARN_HOST: 0.0.0.0
+      WELEARN_PORT: "8000"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
