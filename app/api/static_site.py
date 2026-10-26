@@ -31,7 +31,9 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     if not index.is_file():
         return False
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    # 同时响应 HEAD：监控脚本与部分 CDN/反向代理用 HEAD 探测可用性，
+    # 只注册 GET 会让它们拿到 405，看起来像"页面不存在"
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def spa_fallback(full_path: str) -> FileResponse:
         if full_path == "api" or full_path.startswith("api/"):
             # 前端路由不会占用 /api，走到这里的只能是拼错的接口

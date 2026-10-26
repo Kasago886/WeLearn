@@ -41,6 +41,17 @@ docker compose logs -f welearn     # 看启动日志，Ctrl+C 退出查看
 打开 <http://127.0.0.1:8000> 即可。停止用 `docker compose down`——
 **数据在 `./data`，不会随容器消失**。
 
+> **拉不动镜像（国内常见）**：`docker pull` 报 `failed to resolve reference "docker.io/..."`、
+> `dial tcp ... connectex` 超时，说明到 Docker Hub 的网络不通。在 Docker Desktop →
+> Settings → Docker Engine 里加一段 `registry-mirrors`，Apply & Restart 后再试：
+>
+> ```json
+> { "registry-mirrors": ["https://docker.1ms.run", "https://docker.m.daocloud.io"] }
+> ```
+>
+> 镜像站时效性很强，失效就换一个；有可用代理时，也可以改走 Settings → Resources → Proxies。
+> 配置完用 `docker run --rm hello-world` 验证。
+
 ### 方式二：本机直接跑
 
 需要 Python 3.11+；构建前端还需要 Node 20.19+ 或 22+（只需构建一次）。

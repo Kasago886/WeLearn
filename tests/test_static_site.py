@@ -95,6 +95,18 @@ def test_unknown_non_api_path_returns_index(tmp_path: Path, missing: str) -> Non
     assert TestClient(app).get(missing).status_code == 200
 
 
+def test_head_requests_are_served_without_a_body(tmp_path: Path) -> None:
+    """HEAD 探测（监控、反向代理）要能拿到状态码与缓存头，不能是 405。"""
+    app, _ = make_site(tmp_path)
+    client = TestClient(app)
+
+    for path in ["/", "/subjects/abc/teach", "/assets/app-abc123.js"]:
+        response = client.head(path)
+        assert response.status_code == 200, path
+        assert response.content == b"", path
+        assert response.headers["cache-control"], path
+
+
 def test_frontend_stays_reachable_when_access_token_is_set(tmp_path: Path) -> None:
     """设置访问口令后，前端页面本身仍必须能加载。
 
