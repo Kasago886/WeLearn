@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.infra.deepseek.errors import LlmError, LlmErrorCategory
+from app.infra.llm.errors import LlmError, LlmErrorCategory
 
 
 @pytest.mark.parametrize(

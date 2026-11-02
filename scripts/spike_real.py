@@ -44,8 +44,8 @@ from app.contracts.schemas import (  # noqa: E402
     LearningPathDraft,
     LlmPurpose,
 )
-from app.infra.deepseek.errors import LlmError  # noqa: E402
-from app.infra.deepseek.protocol import TokenUsage  # noqa: E402
+from app.infra.llm.errors import LlmError  # noqa: E402
+from app.infra.llm.protocol import TokenUsage  # noqa: E402
 from app.main_context import AppContext, build_context  # noqa: E402
 from app.prompts import (  # noqa: E402
     ASSESSOR_PROFILE,

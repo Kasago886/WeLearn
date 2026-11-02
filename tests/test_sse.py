@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from app.infra.deepseek.sse import SseEventParser, SseLineKind, iter_payloads, parse_line
+from app.infra.llm.sse import SseEventParser, SseLineKind, iter_payloads, parse_line
 from tests.conftest import fixture_lines
 
 

@@ -52,6 +52,7 @@ from app.contracts.schemas import (
     NodeDecision,
     NodeState,
 )
+from app.infra.llm.providers import profile_for
 from app.services.learning.entities import REVIEW_MODE_ADJACENT, KnowledgePoint
 from app.services.learning.planning import PlanningError
 from app.services.learning.review import ReviewError
@@ -529,6 +530,7 @@ def completion_report(subject_id: str, stack: LearningStack = Depends(get_stack)
     cost = usage.cost_summary(
         subject_id=subject_id,
         price_table=stack.settings_provider().price_table,
+        off_peak_multiplier=profile_for(stack.settings_provider().provider).off_peak_multiplier,
     )
     overview = stack.reviews.overview(subject_id)
     return {

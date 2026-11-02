@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.protocol import TokenUsage
 from app.infra.settings import AppSettings
 from app.main import create_app
 from app.main_context import AppContext, build_context

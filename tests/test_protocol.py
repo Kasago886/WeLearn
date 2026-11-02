@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from app.infra.deepseek.errors import LlmError, LlmErrorCategory
-from app.infra.deepseek.protocol import (
+from app.infra.llm.errors import LlmError, LlmErrorCategory
+from app.infra.llm.protocol import (
     SamplingOptions,
     TokenUsage,
     build_chat_request,

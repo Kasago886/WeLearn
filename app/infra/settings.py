@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import select
 
 from app.contracts.schemas import LlmPurpose, ReasoningEffort
+from app.infra.llm.providers import DEFAULT_PROVIDER, ProviderKind
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.infra.storage.db import Database
 from app.infra.storage.models import AppSettingsRow
@@ -27,6 +28,7 @@ DEFAULT_DATA_DIR = "./data"
 ENV_BASE_URL = "WELEARN_BASE_URL"
 ENV_MODEL_DEFAULT = "WELEARN_MODEL_DEFAULT"
 ENV_MODEL_PRO = "WELEARN_MODEL_PRO"
+ENV_PROVIDER = "WELEARN_PROVIDER"
 ENV_LOG_LEVEL = "WELEARN_LOG_LEVEL"
 ENV_DATA_DIR = "WELEARN_DATA_DIR"
 
@@ -67,6 +69,9 @@ class PurposeOverride(BaseModel):
 class AppSettings(BaseModel):
     """可持久化的应用设置。默认值即 SRS 第 11 章确认后的默认值。"""
 
+    # 接口类型（P6）：决定下发哪些参数、怎么解析响应（见 app/infra/llm/providers.py）。
+    # 默认 DeepSeek：升级后既有安装的行为完全不变。
+    provider: ProviderKind = DEFAULT_PROVIDER
     base_url: str = Field(default="https://api.deepseek.com", min_length=1)
     model_default: str = Field(default="deepseek-flash", min_length=1)
     model_pro: str = Field(default="deepseek-v4-pro", min_length=1)
@@ -122,6 +127,7 @@ class SettingsDiagnostics:
 
 _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     # 字段名 -> (环境变量名, 类型)
+    "provider": (ENV_PROVIDER, "str"),
     "base_url": (ENV_BASE_URL, "str"),
     "model_default": (ENV_MODEL_DEFAULT, "str"),
     "model_pro": (ENV_MODEL_PRO, "str"),
@@ -225,6 +231,15 @@ class SettingsService:
         settings, _ = self.load_with_diagnostics()
         return settings
 
+    def diagnostics(self) -> SettingsDiagnostics:
+        """当前生效配置的诊断（哪些字段非法被回退、哪些被环境变量覆盖）。
+
+        单独提供而不复用 ``load()`` 的中间结果：设置页需要把"改这里不会生效"
+        直接摆在用户面前，而诊断信息本身不参与业务逻辑。
+        """
+        _, diagnostics = self.load_with_diagnostics()
+        return diagnostics
+
     def save(self, settings: AppSettings) -> AppSettings:
         """保存设置并返回生效后的值。data_dir 不随保存变更（见模块文档）。"""
         effective_dir = resolve_data_dir(self._env)
@@ -270,6 +285,7 @@ class SettingsService:
             row.log_retention_days = to_store.log_retention_days
             row.access_token_hash = to_store.access_token_hash
             row.tools_enabled = to_store.tools_enabled
+            row.provider = to_store.provider.value
             session.add(row)
 
         self._log.info("设置已保存")
@@ -316,6 +332,7 @@ class SettingsService:
                 "log_retention_days": row.log_retention_days,
                 "access_token_hash": row.access_token_hash,
                 "tools_enabled": row.tools_enabled,
+                "provider": row.provider,
             }
 
     def _apply_env(self, settings: AppSettings) -> tuple[AppSettings, list[str]]:

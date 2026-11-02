@@ -4,7 +4,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.protocol import TokenUsage
 from app.infra.settings import AppSettings
 from app.services.llm.agent import RoundExecutor
 from app.services.llm.memory import Memory

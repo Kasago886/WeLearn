@@ -1,6 +1,6 @@
 """上下文压缩测试（T1.4，FR-604~FR-609）。"""
 
-from app.infra.deepseek.errors import LlmError
+from app.infra.llm.errors import LlmError
 from app.infra.settings import AppSettings
 from app.services.llm.agent import RoundExecutor
 from app.services.llm.compression import (

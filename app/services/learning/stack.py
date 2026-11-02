@@ -72,6 +72,8 @@ def build_learning_stack(ctx: AppContext) -> LearningStack:
         usage,
         policy,
         max_retries=ctx.settings.max_retries,
+        # 思维链是否回传取决于接口类型：切换后下一轮即生效（P6）
+        provider_getter=lambda: ctx.settings.provider.value,
     )
 
     state = SessionStateService(repos.sessions, repos.subjects)

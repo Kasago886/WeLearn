@@ -3,8 +3,8 @@
 import asyncio
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import StreamEvent
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import StreamEvent
 from app.infra.settings import AppSettings
 from app.services.llm.agent import RoundExecutor
 from app.services.llm.dispatcher import RoundDispatcher

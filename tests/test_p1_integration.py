@@ -10,8 +10,8 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import BlockingResult, StreamEvent, TokenUsage
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import BlockingResult, StreamEvent, TokenUsage
 from app.infra.settings import AppSettings
 from app.services.llm.agent import RoundExecutor
 from app.services.llm.compression import CompressionOutcome, ContextCompressor

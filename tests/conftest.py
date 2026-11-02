@@ -13,12 +13,12 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from app.infra.deepseek.client import DeepSeekClient
+from app.infra.llm.client import LlmClient
 from app.main_context import AppContext, build_context
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "llm"
 
-ClientFactory = Callable[..., DeepSeekClient]
+ClientFactory = Callable[..., LlmClient]
 
 
 def fixture_text(name: str) -> str:
@@ -56,7 +56,7 @@ async def make_client() -> AsyncIterator[ClientFactory]:
     """构造注入了 MockTransport 的客户端，并在测试结束后关闭底层连接。"""
     opened: list[httpx.AsyncClient] = []
 
-    def _make(handler: Callable[[httpx.Request], httpx.Response], **overrides: Any) -> DeepSeekClient:
+    def _make(handler: Callable[[httpx.Request], httpx.Response], **overrides: Any) -> LlmClient:
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         params: dict[str, Any] = {
             "base_url_getter": lambda: "https://api.deepseek.com",
@@ -66,7 +66,7 @@ async def make_client() -> AsyncIterator[ClientFactory]:
         }
         params.update(overrides)
         opened.append(http)
-        return DeepSeekClient(**params)
+        return LlmClient(**params)
 
     yield _make
 

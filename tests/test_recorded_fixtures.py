@@ -23,8 +23,8 @@ import httpx
 import pytest
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.client import DeepSeekClient
-from app.infra.deepseek.protocol import ModelInfo, parse_blocking_response, parse_models_response
+from app.infra.llm.client import LlmClient
+from app.infra.llm.protocol import ModelInfo, parse_blocking_response, parse_models_response
 
 RECORDED_DIR = Path(__file__).parent / "fixtures" / "llm" / "recorded"
 
@@ -92,7 +92,7 @@ async def test_real_stream_replays_through_client() -> None:
         return httpx.Response(200, content=read_text("stream_normal.sse").encode("utf-8"))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = DeepSeekClient(
+    client = LlmClient(
         base_url_getter=lambda: "https://api.deepseek.com",
         api_key_getter=lambda: "sk-test-000000000000",
         http_client=http,
@@ -144,7 +144,7 @@ async def test_real_stream_yields_usage_only_event_last() -> None:
         return httpx.Response(200, content=read_text("stream_normal.sse").encode("utf-8"))
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = DeepSeekClient(
+    client = LlmClient(
         base_url_getter=lambda: "https://api.deepseek.com",
         api_key_getter=lambda: "sk-test-000000000000",
         http_client=http,
@@ -244,7 +244,7 @@ def test_replay_does_not_need_keepalive_lines() -> None:
     lines = read_text("stream_normal.sse").splitlines()
     assert not any(line.startswith(": ") for line in lines)
 
-    from app.infra.deepseek.sse import SseEventParser
+    from app.infra.llm.sse import SseEventParser
 
     parser = SseEventParser()
     payloads: list[str] = []

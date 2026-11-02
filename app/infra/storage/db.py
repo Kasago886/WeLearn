@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infra.storage.models import Base, SchemaVersionRow, utcnow
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 """当前表结构版本。
 
 - v1：设置、密钥、会话记忆、用量（P0/P1）。
@@ -47,6 +47,9 @@ SCHEMA_VERSION = 7
   - ``app_settings.log_max_mb`` / ``log_retention_days``：日志轮转与保留（FR-907）；
   - ``app_settings.access_token_hash``：可选访问口令（FR-903），**只存哈希**；
   - ``app_settings.tools_enabled``：工具调用开关（FR-714），默认关闭。
+- v8（P6）：
+  - ``app_settings.provider``：接口类型（``deepseek`` / ``openai``），决定下发哪些参数与
+    怎么解析响应。**留空即走默认（DeepSeek）**，因此老库不需要回填——它的行为与升级前一致。
 
 升级策略有两条，都是幂等的，因此对"全新库"与"已有库"都安全：
 
@@ -85,6 +88,9 @@ _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     ("app_settings", "tools_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
     ("knowledge_point", "review_box", "INTEGER NOT NULL DEFAULT 0"),
     ("knowledge_point", "review_due_at", "DATETIME"),
+    # v8（P6）：接口类型留空即按默认（DeepSeek）处理——
+    # 老库升级后行为与升级前完全一致，用户想换接口再去设置页切
+    ("app_settings", "provider", "VARCHAR(16)"),
 )
 
 

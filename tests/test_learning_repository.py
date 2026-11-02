@@ -157,7 +157,7 @@ def test_subject_delete_cascades_everything(repos: DomainRepositories, context: 
 
 def test_progress_and_summary(repos: DomainRepositories, context: AppContext) -> None:
     from app.contracts.schemas import LlmPurpose
-    from app.infra.deepseek.protocol import TokenUsage
+    from app.infra.llm.protocol import TokenUsage
     from app.services.llm.usage import UsageRecorder
 
     subject = repos.subjects.create("有进度的主题")

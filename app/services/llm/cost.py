@@ -7,6 +7,8 @@
 2. **高峰 / 空闲双价**：北京时间周一至周五 9:00–12:00、14:00–18:00 为高峰，
    其余时段（含周末与法定节假日）为空闲，**空闲价是高峰价的一半**。
    因此表里存的是高峰价，结算时按请求实际发生的时刻打折。
+   空闲折扣是 DeepSeek 的计价规则；其他接口类型按固定价结算（系数 1.0），
+   由 :mod:`app.infra.llm.providers` 的档案给出。
 3. **按请求实际发生的时段计价**：不能拿"当前时刻"去估算历史用量，
    否则同一批记录在晚上和白天的估算结果会不一样。
 
@@ -92,20 +94,26 @@ def estimate_cost(
     output_tokens: int = 0,
     at: datetime | None = None,
     price_table: dict[str, dict[str, float]] | None = None,
+    off_peak_multiplier: float = OFF_PEAK_MULTIPLIER,
 ) -> CostEstimate:
     """按"这一批 token 发生在 ``at`` 时刻"估算费用。
 
     同一个模型的命中/未命中输入分开计价：混在一起按未命中价算会高估，
     反过来会低估，两种都会让"这个主题花了多少钱"变得不可信。
+
+    ``off_peak_multiplier`` 由接口类型决定：DeepSeek 空闲半价（0.5），
+    其他供应商按固定价（1.0）——给 OpenAI 兼容服务套上夜间五折只会把金额算少一半。
     """
     table = effective_price_table(price_table)
     prices = table.get(model)
     if prices is None:
         # 未知模型：用保守的默认模型价，避免显示 0 元让人误以为免费
-        prices = table.get("deepseek-flash", {"cache_hit": 0.0, "cache_miss": 0.0, "output": 0.0})
+        fallback = next(iter(table.values()), {"cache_hit": 0.0, "cache_miss": 0.0, "output": 0.0})
+        prices = fallback
 
     moment = at or datetime.now(UTC)
-    factor = multiplier_at(moment)
+    peak = is_peak(moment)
+    factor = 1.0 if peak else max(0.0, off_peak_multiplier)
 
     tokens = max(0, cached_prompt_tokens) + max(0, cache_miss_tokens) + max(0, output_tokens)
     amount = (
@@ -114,7 +122,7 @@ def estimate_cost(
         + max(0, output_tokens) / 1_000_000 * prices["output"]
     ) * factor
 
-    if is_peak(moment):
+    if peak:
         return CostEstimate(amount=amount, peak_tokens=tokens, off_peak_tokens=0)
     return CostEstimate(amount=amount, peak_tokens=0, off_peak_tokens=tokens)
 

@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.api import billing
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
+from app.infra.llm.errors import LlmError
 from app.infra.storage.models import UsageRecordRow
 from app.main import create_app
 from app.main_context import AppContext

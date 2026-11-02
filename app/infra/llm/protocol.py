@@ -1,6 +1,10 @@
-"""chat/completions 请求与响应协议（FR-701、FR-705、FR-716、FR-717、FR-718）。
+"""chat/completions 请求与响应协议（FR-701、FR-705、FR-716、FR-717、FR-718；P6 供应商档案）。
 
-请求体构建规则来自官方文档，有两条容易踩坑、这里显式处理：
+本模块只负责**OpenAI 兼容协议**本身；各家差异（思考开关、思维链字段名、缓存统计口径、
+余额接口）由 :mod:`app.infra.llm.providers` 的档案描述，这里按档案组装与解析。
+不传 ``profile`` 时按 DeepSeek 处理——保持既有调用方与测试的行为不变。
+
+请求体构建规则里有两条容易踩坑、这里显式处理：
 
 1. **`tools` 只在确有工具时下发**——官方语义是"无 tool 时 tool_choice 默认为 none"，
    但部分兼容端点不接受 `"tools": null`；
@@ -20,7 +24,7 @@
 - **请求侧**：给了非空 `tools` 才下发 `tools`，**永远不下发 `tool_choice`**。
   原因是官方限制——思考模式下 `tool_choice="required"` 与"指定具体某个工具"都会返回 400，
   而本项目的教学调用可能就处在思考模式，写死 `tool_choice` 等于让一条正常请求随机 400；
-  不下发时默认值是 `auto`，模型自己决定是否调用，这恰好也是我们要的语义。
+  不下发时默认值是 `auto`，这恰好也是我们要的语义（对 OpenAI 兼容服务同样成立）。
 - **响应侧**：流式按 `index` 累积 `delta.tool_calls`（`id` / `name` 只取首个非空块，
   `arguments` 逐块拼接），非流式直接读 `message.tool_calls`，两者都归一成
   :class:`ToolCall`，上层因此不必区分两种传输方式。
@@ -31,15 +35,22 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.events import UsagePayload
-from app.infra.deepseek.errors import LlmError
+from app.infra.llm.errors import LlmError
+from app.infra.llm.providers import ProviderKind, ProviderProfile, profile_for
 
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 MODELS_PATH = "/models"
 BALANCE_PATH = "/user/balance"
+"""DeepSeek 的余额接口。其他供应商由档案的 ``balance_path`` 决定（通常没有）。"""
 
 # 官方默认值：不显式配置时保持与"不下发"等价的行为
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 1.0
+
+
+def _profile_or_default(profile: ProviderProfile | None) -> ProviderProfile:
+    """没指定档案时按 DeepSeek 处理：既有调用方与测试都建立在这个口径上。"""
+    return profile if profile is not None else profile_for(ProviderKind.DEEPSEEK)
 
 
 @dataclass(frozen=True)
@@ -54,9 +65,9 @@ def build_endpoint(base_url: str, path: str) -> str:
     """拼接端点；直接拼接而非用 BaseAddress，以保留 base_url 中的子路径（如 /v1）。"""
     url = (base_url or "").strip().rstrip("/")
     if not url:
-        raise LlmError.config("未配置 DeepSeek API 地址，请在设置中填写。")
+        raise LlmError.config("未配置模型接口地址，请在设置中填写。")
     if not url.startswith(("http://", "https://")):
-        raise LlmError.config("DeepSeek API 地址必须以 http:// 或 https:// 开头。")
+        raise LlmError.config("模型接口地址必须以 http:// 或 https:// 开头。")
     return f"{url}{path}"
 
 
@@ -72,19 +83,48 @@ class TokenUsage:
     total_tokens: int = 0
 
     @classmethod
-    def from_usage_dict(cls, usage: Mapping[str, Any] | None) -> "TokenUsage | None":
+    def from_usage_dict(
+        cls,
+        usage: Mapping[str, Any] | None,
+        *,
+        profile: ProviderProfile | None = None,
+    ) -> "TokenUsage | None":
+        """解析用量。缓存字段的名目按供应商档案取，缺字段一律按 0 处理。"""
         if not isinstance(usage, Mapping):
             return None
 
+        resolved = _profile_or_default(profile)
         details = usage.get("completion_tokens_details")
 
         def as_int(value: Any) -> int:
             return int(value) if isinstance(value, int | float) else 0
 
+        def first_int(candidates: Sequence[str], source: Mapping[str, Any]) -> int:
+            for name in candidates:
+                if name in source:
+                    return as_int(source.get(name))
+            return 0
+
+        prompt_tokens = as_int(usage.get("prompt_tokens"))
+        cached = first_int(resolved.cache_hit_fields, usage)
+        if cached == 0:
+            # 容错优先：网关可能把 DeepSeek 的缓存字段统一改写成了 OpenAI 的写法。
+            # 不认这个形状的话，命中与未命中都会是 0，成本只算上输出部分——少算一半以上
+            prompt_details = usage.get("prompt_tokens_details")
+            details_field = resolved.cache_details_field or "cached_tokens"
+            if isinstance(prompt_details, Mapping):
+                cached = as_int(prompt_details.get(details_field))
+
+        miss = first_int(resolved.cache_miss_fields, usage)
+        # 只有"确实给了未命中字段"时才信它；否则按"总数 - 命中"推算，
+        # 否则命中部分不会被排除，输入 token 会整段消失（既不算命中也不算未命中）
+        if not any(name in usage for name in resolved.cache_miss_fields):
+            miss = max(0, prompt_tokens - cached)
+
         return cls(
-            prompt_tokens=as_int(usage.get("prompt_tokens")),
-            cached_prompt_tokens=as_int(usage.get("prompt_cache_hit_tokens")),
-            cache_miss_tokens=as_int(usage.get("prompt_cache_miss_tokens")),
+            prompt_tokens=prompt_tokens,
+            cached_prompt_tokens=cached,
+            cache_miss_tokens=miss,
             completion_tokens=as_int(usage.get("completion_tokens")),
             reasoning_tokens=as_int(details.get("reasoning_tokens")) if isinstance(details, Mapping) else 0,
             total_tokens=as_int(usage.get("total_tokens")),
@@ -158,31 +198,44 @@ def build_chat_request(
     json_object: bool = False,
     tools: Sequence[Mapping[str, Any]] | None = None,
     sampling: SamplingOptions | None = None,
+    profile: ProviderProfile | None = None,
+    drop: frozenset[str] = frozenset(),
+    max_tokens_field: str = "max_tokens",
 ) -> dict[str, Any]:
-    """构建 chat/completions 请求体。"""
+    """构建 chat/completions 请求体。
+
+    ``drop`` 是"该接口已被证实不支持、这次不要下发"的参数名集合；
+    ``max_tokens_field`` 允许在网关只认 ``max_completion_tokens`` 时改名。
+    两者都由客户端在收到 400/422 后按错误提示补充（见 ``LlmClient`` 的降级逻辑），
+    正常情况下不会走到。
+    """
     if not model.strip():
         raise LlmError.config("未配置模型名，请在设置中填写。")
 
+    resolved = _profile_or_default(profile)
     body: dict[str, Any] = {
         "model": model.strip(),
         "messages": list(messages),
         "stream": stream,
-        "thinking": {"type": "enabled" if thinking else "disabled"},
     }
 
-    # 思考关闭时下发 effort 没有意义
-    if thinking and reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
+    # 思考开关只有 DeepSeek 认：发给通用接口轻则被忽略、重则 400
+    if resolved.send_thinking and "thinking" not in drop:
+        body["thinking"] = {"type": "enabled" if thinking else "disabled"}
+
+    # 思考关闭时下发 effort 没有意义；档位按该服务的取值映射（本项目有 max，OpenAI 没有）
+    if thinking and reasoning_effort and resolved.send_reasoning_effort and "reasoning_effort" not in drop:
+        body["reasoning_effort"] = resolved.map_effort(reasoning_effort)
 
     if max_tokens > 0:
-        body["max_tokens"] = max_tokens
+        body[max_tokens_field] = max_tokens
 
     # 采样参数：只在调用方给出时下发（思考模式下会被官方忽略/钳制，见模块文档）
     if sampling is not None:
         body["temperature"] = sampling.temperature
         body["top_p"] = sampling.top_p
 
-    if json_object:
+    if json_object and "response_format" not in drop:
         body["response_format"] = {"type": "json_object"}
 
     if tools:
@@ -192,8 +245,11 @@ def build_chat_request(
     return body
 
 
-def extract_delta(chunk: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    """从流式数据块中取出正文增量与思维链增量。"""
+def extract_delta(chunk: Mapping[str, Any], *, profile: ProviderProfile | None = None) -> tuple[str | None, str | None]:
+    """从流式数据块中取出正文增量与思维链增量。
+
+    思维链字段名各家不同（``reasoning_content`` / ``reasoning``），按档案顺序尝试。
+    """
     choices = chunk.get("choices")
     if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
         return None, None
@@ -207,17 +263,22 @@ def extract_delta(chunk: Mapping[str, Any]) -> tuple[str | None, str | None]:
         return None, None
 
     content = delta.get("content")
-    reasoning = delta.get("reasoning_content")
+    reasoning = None
+    for name in _profile_or_default(profile).reasoning_fields:
+        candidate = delta.get(name)
+        if isinstance(candidate, str) and candidate:
+            reasoning = candidate
+            break
     return (
         content if isinstance(content, str) and content else None,
-        reasoning if isinstance(reasoning, str) and reasoning else None,
+        reasoning,
     )
 
 
-def extract_usage(chunk: Mapping[str, Any]) -> TokenUsage | None:
+def extract_usage(chunk: Mapping[str, Any], *, profile: ProviderProfile | None = None) -> TokenUsage | None:
     """从流式数据块中取出用量（仅在最后一个数据块出现）。"""
     usage = chunk.get("usage")
-    return TokenUsage.from_usage_dict(usage if isinstance(usage, Mapping) else None)
+    return TokenUsage.from_usage_dict(usage if isinstance(usage, Mapping) else None, profile=profile)
 
 
 def _first_delta(chunk: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -323,7 +384,7 @@ class BlockingResult:
     tool_calls: tuple[ToolCall, ...] = ()
 
 
-def parse_blocking_response(body: Mapping[str, Any]) -> BlockingResult:
+def parse_blocking_response(body: Mapping[str, Any], *, profile: ProviderProfile | None = None) -> BlockingResult:
     """解析非流式响应；结构不符时抛可诊断的协议错误。"""
     choices = body.get("choices")
     if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
@@ -338,10 +399,18 @@ def parse_blocking_response(body: Mapping[str, Any]) -> BlockingResult:
     # 官方已知问题：JSON Output 有概率返回空 content（FR-716）；空串按空内容返回，由上层重试
     content = raw_content if isinstance(raw_content, str) else ""
 
-    raw_reasoning = message.get("reasoning_content")
-    reasoning = raw_reasoning if isinstance(raw_reasoning, str) and raw_reasoning else None
+    resolved = _profile_or_default(profile)
+    reasoning = None
+    for name in resolved.reasoning_fields:
+        candidate = message.get(name)
+        if isinstance(candidate, str) and candidate:
+            reasoning = candidate
+            break
 
-    usage = TokenUsage.from_usage_dict(body.get("usage") if isinstance(body.get("usage"), Mapping) else None)
+    usage = TokenUsage.from_usage_dict(
+        body.get("usage") if isinstance(body.get("usage"), Mapping) else None,
+        profile=resolved,
+    )
     return BlockingResult(
         content=content,
         reasoning=reasoning,

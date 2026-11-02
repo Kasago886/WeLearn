@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import BlockingResult, StreamEvent, TokenUsage
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import BlockingResult, StreamEvent, TokenUsage
 
 
 @dataclass

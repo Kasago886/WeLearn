@@ -212,7 +212,7 @@ def test_p4_settings_round_trip(api_client: TestClient) -> None:
 
 def test_usage_reports_cost(api_client: TestClient) -> None:
     from app.contracts.schemas import LlmPurpose
-    from app.infra.deepseek.protocol import TokenUsage
+    from app.infra.llm.protocol import TokenUsage
     from app.services.llm.usage import UsageRecorder
 
     ctx = api_client.app.state.ctx  # type: ignore[attr-defined]

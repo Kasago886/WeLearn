@@ -1,10 +1,15 @@
-"""DeepSeek HTTP 客户端（FR-701、FR-704、FR-709、FR-711、FR-712、FR-715、FR-718）。
+"""OpenAI 兼容的 LLM HTTP 客户端（FR-701、FR-704、FR-709、FR-711、FR-712、FR-715、FR-718）。
+
+协议本身是 OpenAI 的 ``/chat/completions``；DeepSeek 的额外能力（思考开关、缓存统计、
+余额接口、空闲半价）由 :mod:`app.infra.llm.providers` 的档案按接口类型开启。
 
 设计要点：
 
-- **连接配置按需读取**：base_url / API Key / 采样参数 / 审计开关都通过 getter 注入，
+- **连接配置按需读取**：base_url / API Key / 采样参数 / 审计开关 / 接口类型都通过 getter 注入，
   设置页改完即时生效，无需重建客户端；
 - **重试边界**：只在"尚未产出任何增量"时重试。已经吐给用户的流不重试，避免重复内容（FR-412）；
+- **能力降级**：接口明确回 400/422 且点出某个参数名时，记下来重发一次（不带该参数），
+  而不是把"这个网关不认 reasoning_effort"变成用户面前的一条报错；
 - **错误统一为** :class:`LlmError`：状态码映射、网络异常、协议异常都不外泄原始堆栈；
 - **可注入**：实现 :class:`LlmClientProtocol`，测试可传入桩实现或 httpx.MockTransport（NFR-115）。
 """
@@ -21,9 +26,8 @@ from typing import Any, Protocol
 import httpx
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import (
-    BALANCE_PATH,
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import (
     CHAT_COMPLETIONS_PATH,
     MODELS_PATH,
     BlockingResult,
@@ -38,7 +42,8 @@ from app.infra.deepseek.protocol import (
     parse_blocking_response,
     parse_models_response,
 )
-from app.infra.deepseek.sse import SseEventParser
+from app.infra.llm.providers import ProviderProfile, profile_for
+from app.infra.llm.sse import SseEventParser
 from app.infra.logging.queue_logger import CHANNEL_LLM, get_logger
 from app.infra.redaction import Redactor
 
@@ -47,6 +52,17 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_TEST_TIMEOUT_SECONDS = 30
 # 审计正文的长度上限（FR-715）：审计是为了排障，不是做归档，超长正文会把日志通道撑爆
 AUDIT_TEXT_LIMIT = 4000
+
+# "该接口不认这个参数"时的降级候选：参数名 → 错误正文里的线索词。
+# 只有 400/422 且正文里确实出现线索词才降级，避免把"模型名写错"这类真实错误也重试一遍。
+_DEGRADABLE_PARAMS: dict[str, tuple[str, ...]] = {
+    "reasoning_effort": ("reasoning_effort",),
+    "response_format": ("response_format", "json_object"),
+    "thinking": ("thinking",),
+}
+# 少数网关只认新版字段名（OpenAI 的推理模型就是这样）：
+# 报错里出现它时把 max_tokens 换成 max_completion_tokens 重发一次
+_ALT_MAX_TOKENS_FIELD = "max_completion_tokens"
 
 
 @lru_cache(maxsize=1)
@@ -104,8 +120,8 @@ class LlmClientProtocol(Protocol):
     ) -> BlockingResult: ...
 
 
-class DeepSeekClient:
-    """DeepSeek 的 OpenAI 兼容客户端。"""
+class LlmClient:
+    """OpenAI 兼容客户端（DeepSeek 的额外能力按接口类型开启）。"""
 
     def __init__(
         self,
@@ -119,6 +135,7 @@ class DeepSeekClient:
         log_payload: bool = False,
         audit_getter: Callable[[], bool] | None = None,
         sampling_getter: Callable[[], SamplingOptions] | None = None,
+        provider_getter: Callable[[], str] | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url_getter = base_url_getter
@@ -130,6 +147,10 @@ class DeepSeekClient:
         self._log_payload = log_payload
         self._audit_getter = audit_getter
         self._sampling_getter = sampling_getter
+        self._provider_getter = provider_getter
+        # 已证实不被该接口接受的参数（按错误正文自动发现），只在内存里记，进程重启即忘
+        self._drops: set[str] = set()
+        self._max_tokens_field = "max_tokens"
         self._log = get_logger(CHANNEL_LLM)
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
@@ -163,6 +184,39 @@ class DeepSeekClient:
         if self._sampling_getter is None:
             return SamplingOptions()
         return self._sampling_getter()
+
+    def profile(self) -> ProviderProfile:
+        """当前接口类型的能力档案（每次现取，切换后下一个请求即生效）。"""
+        if self._provider_getter is None:
+            return profile_for(None)
+        return profile_for(self._provider_getter())
+
+    def _degrade(self, error: LlmError) -> bool:
+        """遇到"该接口不认这个参数"时记下来，返回 True 表示值得原样重发一次。
+
+        只认 400/422 且错误正文明确点到参数名的情形：把"模型名写错""Key 无效"
+        也当降级重试，只会让用户多等一倍时间、看到的还是同一个错。
+        """
+        if error.status_code not in (400, 422):
+            return False
+
+        detail = (error.detail or "").lower()
+        changed: list[str] = []
+        for param, hints in _DEGRADABLE_PARAMS.items():
+            if param in self._drops:
+                continue
+            if any(hint in detail for hint in hints):
+                self._drops.add(param)
+                changed.append(param)
+
+        if self._max_tokens_field != _ALT_MAX_TOKENS_FIELD and _ALT_MAX_TOKENS_FIELD in detail:
+            self._max_tokens_field = _ALT_MAX_TOKENS_FIELD
+            changed.append(f"max_tokens→{_ALT_MAX_TOKENS_FIELD}")
+
+        if changed:
+            self._log.warning(f"接口不支持以下参数，已自动降级并重发: {', '.join(changed)}")
+            return True
+        return False
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -222,6 +276,9 @@ class DeepSeekClient:
             except LlmError as exc:
                 if content_emitted or tool_calls_emitted:
                     raise
+                # 参数不被接受：降级后立刻重发，不占用重试次数（否则第一次就要用光重试）
+                if self._degrade(exc):
+                    continue
                 error = exc
             else:
                 if content_emitted or tool_calls_emitted:
@@ -251,7 +308,8 @@ class DeepSeekClient:
         tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         url = build_endpoint(self._base_url_getter(), CHAT_COMPLETIONS_PATH)
-        body = build_chat_request(
+        profile = self.profile()
+        body = self._body(
             model=model,
             messages=messages,
             stream=True,
@@ -259,8 +317,8 @@ class DeepSeekClient:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             json_object=json_object,
-            sampling=self._sampling(),
             tools=tools,
+            profile=profile,
         )
         self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
 
@@ -300,11 +358,11 @@ class DeepSeekClient:
                             self._log.warning(f"跳过无法解析的流式数据块: {exc.msg}")
                             continue
 
-                        usage = extract_usage(chunk)
+                        usage = extract_usage(chunk, profile=profile)
                         if usage is not None:
                             last_usage = usage
 
-                        content, reasoning = extract_delta(chunk)
+                        content, reasoning = extract_delta(chunk, profile=profile)
                         if content or reasoning:
                             yield StreamEvent(content=content, reasoning=reasoning)
                         # 工具调用增量没有可展示的正文，累积到流结束一次性给出
@@ -347,21 +405,23 @@ class DeepSeekClient:
     ) -> BlockingResult:
         """非流式对话（判定、压缩等场景）。"""
         url = build_endpoint(self._base_url_getter(), CHAT_COMPLETIONS_PATH)
-        body = build_chat_request(
-            model=model,
-            messages=messages,
-            stream=False,
-            thinking=thinking,
-            reasoning_effort=reasoning_effort,
-            max_tokens=max_tokens,
-            json_object=json_object,
-            sampling=self._sampling(),
-            tools=tools,
-        )
-        self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
+        profile = self.profile()
 
         attempt = 0
         while True:
+            body = self._body(
+                model=model,
+                messages=messages,
+                stream=False,
+                thinking=thinking,
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
+                json_object=json_object,
+                tools=tools,
+                profile=profile,
+            )
+            if attempt == 0:
+                self._log_request(purpose, model, messages, thinking, reasoning_effort, json_object, body)
             try:
                 response = await self._client.post(
                     url,
@@ -379,10 +439,14 @@ class DeepSeekClient:
                 else:
                     if self.audit_enabled():
                         self._log_response(purpose, model, response.text)
-                    result = self._parse_blocking(response)
+                    result = self._parse_blocking(response, profile)
                     if result.usage is not None:
                         self._log_usage(purpose, model, result.usage)
                     return result
+
+            # 参数不被接受：降级后立刻重发，不占用重试次数
+            if self._degrade(error):
+                continue
 
             if not error.retryable or attempt >= self._max_retries:
                 raise error
@@ -393,7 +457,36 @@ class DeepSeekClient:
             )
             await self._sleep_backoff(attempt)
 
-    def _parse_blocking(self, response: httpx.Response) -> BlockingResult:
+    def _body(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        stream: bool,
+        thinking: bool,
+        reasoning_effort: str,
+        max_tokens: int,
+        json_object: bool,
+        tools: Sequence[Mapping[str, Any]] | None,
+        profile: ProviderProfile,
+    ) -> dict[str, Any]:
+        """按当前接口类型与已发现的降级项组装请求体。"""
+        return build_chat_request(
+            model=model,
+            messages=messages,
+            stream=stream,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
+            json_object=json_object,
+            sampling=self._sampling(),
+            tools=tools,
+            profile=profile,
+            drop=frozenset(self._drops),
+            max_tokens_field=self._max_tokens_field,
+        )
+
+    def _parse_blocking(self, response: httpx.Response, profile: ProviderProfile) -> BlockingResult:
         try:
             body = response.json()
         except json.JSONDecodeError as exc:
@@ -401,20 +494,31 @@ class DeepSeekClient:
 
         if not isinstance(body, Mapping):
             raise LlmError.protocol("响应结构不符合预期（根节点不是对象）。")
-        return parse_blocking_response(body)
+        return parse_blocking_response(body, profile=profile)
 
     # ------------------------------------------------------------------ #
     # 辅助接口
     # ------------------------------------------------------------------ #
 
     async def list_models(self, *, timeout_seconds: int | None = None) -> list[ModelInfo]:
-        """获取可用模型与元数据（FR-702），避免模型名写死失效。"""
+        """获取可用模型与元数据（FR-702），避免模型名写死失效。
+
+        只有部分服务（如 DeepSeek）会在 ``/models`` 里带上下文窗口与档位；
+        其余返回的只是 id 列表，元数据字段留空即可——界面按"未知"展示，不编造数字。
+        """
         body = await self._get_json(MODELS_PATH, timeout_seconds)
         return parse_models_response(body)
 
     async def get_balance(self, *, timeout_seconds: int | None = None) -> Mapping[str, Any]:
-        """查询账户余额（FR-710，可选能力）。"""
-        return await self._get_json(BALANCE_PATH, timeout_seconds)
+        """查询账户余额（FR-710，可选能力）。
+
+        余额是 DeepSeek 特有的接口；当前接口类型没有这个能力时抛配置错误，
+        由 API 层翻译成"该接口不支持余额查询"，不打扰主流程。
+        """
+        path = self.profile().balance_path
+        if path is None:
+            raise LlmError.config(f"当前接口类型（{self.profile().kind.value}）不提供余额查询接口。")
+        return await self._get_json(path, timeout_seconds)
 
     async def test_connection(
         self,

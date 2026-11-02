@@ -237,7 +237,7 @@ async def test_answer_without_running_assessment_raises(context: AppContext) -> 
 
 
 async def test_answer_propagates_llm_failure(context: AppContext) -> None:
-    from app.infra.deepseek.errors import LlmError
+    from app.infra.llm.errors import LlmError
 
     harness = make_harness(
         context,
@@ -264,7 +264,7 @@ async def test_failed_turn_leaves_the_question_askable_again(context: AppContext
     最后一条就变成 user、待答问题为空，提交按钮点不动——用户既看不到问题也重试不了。
     真实故障（2026-10-13）正是这样：模型返回空正文，用户提交回答后界面毫无反应。
     """
-    from app.infra.deepseek.errors import LlmError
+    from app.infra.llm.errors import LlmError
 
     harness = make_harness(
         context,

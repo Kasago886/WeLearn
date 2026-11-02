@@ -33,7 +33,7 @@ from sqlalchemy import text
 from app.contracts.schemas import NodeState
 from app.infra.paths import DataPaths
 from app.infra.secrets import SecretStore
-from app.infra.storage.db import Database
+from app.infra.storage.db import SCHEMA_VERSION, Database
 from app.main_context import DATABASE_FILENAME
 from app.services.learning.entities import LearningPath
 from app.services.learning.repository import DomainRepositories
@@ -206,7 +206,7 @@ def test_restore_rolls_back_to_snapshot_and_keeps_the_original(tmp_path: Path) -
     # 恢复出来的库要能直接被应用打开（升级流程幂等，重跑无副作用）
     restored = Database.from_path(result.target)
     try:
-        assert restored.init() == 7
+        assert restored.init() == SCHEMA_VERSION
         assert [subject.title for subject in DomainRepositories(restored).subjects.list_all()] == ["第一批主题"]
     finally:
         restored.dispose()
@@ -278,7 +278,7 @@ def test_committed_data_survives_an_abrupt_exit(tmp_path: Path) -> None:
     reopened = Database.from_path(db_path)
     try:
         # 崩溃后重启：升级流程与正常启动一致，必须先能跑通
-        assert reopened.init() == 7
+        assert reopened.init() == SCHEMA_VERSION
         titles = [subject.title for subject in DomainRepositories(reopened).subjects.list_all()]
     finally:
         reopened.dispose()
@@ -301,7 +301,7 @@ def downgrade_to_v6(db: Database) -> None:
             connection.exec_driver_sql(f"ALTER TABLE knowledge_point DROP COLUMN {column}")
         for column in V7_SETTINGS_COLUMNS:
             connection.exec_driver_sql(f"ALTER TABLE app_settings DROP COLUMN {column}")
-        connection.exec_driver_sql("DELETE FROM schema_version WHERE version = 7")
+        connection.exec_driver_sql("DELETE FROM schema_version WHERE version = ?", (SCHEMA_VERSION,))
         connection.exec_driver_sql(
             "INSERT INTO schema_version (version, applied_at) VALUES (6, '2026-09-01 00:00:00')"
         )
@@ -348,11 +348,11 @@ def test_v6_database_upgrades_to_v7_without_losing_data(tmp_path: Path) -> None:
     upgraded = Database.from_path(db_path)
     try:
         # 相当于"装了新版本后第一次启动"
-        assert upgraded.init() == 7
+        assert upgraded.init() == SCHEMA_VERSION
         assert set(V7_NODE_COLUMNS) <= column_names(upgraded, "knowledge_point")
         assert set(V7_SETTINGS_COLUMNS) <= column_names(upgraded, "app_settings")
         with upgraded.engine.connect() as connection:
-            assert connection.execute(text("SELECT MAX(version) FROM schema_version")).scalar_one() == 7
+            assert connection.execute(text("SELECT MAX(version) FROM schema_version")).scalar_one() == SCHEMA_VERSION
 
         repos = DomainRepositories(upgraded)
         assert [subject.title for subject in repos.subjects.list_all()] == ["升级演练主题"]

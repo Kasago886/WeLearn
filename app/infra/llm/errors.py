@@ -1,10 +1,11 @@
-"""DeepSeek 错误分类（FR-709、FR-712）。
+"""LLM 错误分类（FR-709、FR-712）。
 
 目标：把 HTTP 状态码 / 网络异常翻译成"发生了什么 + 能做什么 + 能不能重试"三件事，
 使上层不必再判断状态码。重试策略完全由 :attr:`LlmError.retryable` 决定。
 
-官方错误码（https://api-docs.deepseek.com/zh-cn/quick_start/error_codes）：
-400 格式错误 / 401 认证失败 / 402 余额不足 / 422 参数错误 / 429 速率上限 / 500 服务器故障 / 503 服务器繁忙。
+状态码语义取自 OpenAI 兼容接口的通用约定（DeepSeek 官方的错误码表与之一致）：
+400 格式错误 / 401 认证失败 / 402 余额不足 / 422 参数错误 / 429 速率上限 / 500 服务故障 / 503 服务繁忙。
+文案不写死供应商名字——同一份代码可能连的是 DeepSeek、本地 vLLM 或某个网关。
 """
 
 from enum import StrEnum
@@ -34,8 +35,8 @@ _STATUS_TABLE: dict[int, tuple[LlmErrorCategory, bool, str]] = {
     402: (LlmErrorCategory.BALANCE, False, "账户余额不足，请充值后重试。"),
     422: (LlmErrorCategory.INVALID_PARAMS, False, "请求参数错误，请检查模型名与参数取值。"),
     429: (LlmErrorCategory.RATE_LIMIT, True, "请求速率达到上限，稍后会自动重试。"),
-    500: (LlmErrorCategory.SERVER_ERROR, True, "DeepSeek 服务器故障，稍后会自动重试。"),
-    503: (LlmErrorCategory.UNAVAILABLE, True, "DeepSeek 服务器繁忙，稍后会自动重试。"),
+    500: (LlmErrorCategory.SERVER_ERROR, True, "模型服务故障，稍后会自动重试。"),
+    503: (LlmErrorCategory.UNAVAILABLE, True, "模型服务繁忙，稍后会自动重试。"),
 }
 
 

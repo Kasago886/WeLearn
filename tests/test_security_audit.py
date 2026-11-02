@@ -34,7 +34,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.infra.deepseek.client import DeepSeekClient
+from app.infra.llm.client import LlmClient
 from app.infra.paths import PathTraversalError
 from app.infra.storage.models import ApiKeySecretRow
 from app.main import create_app
@@ -162,7 +162,7 @@ def audit_api(tmp_path: Path) -> Iterator[AuditHarness]:
     ctx: AppContext = app.state.ctx
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(_mock_llm))
-    ctx.llm = DeepSeekClient(  # type: ignore[assignment]  # 只换传输层，其余逻辑保持真实
+    ctx.llm = LlmClient(  # type: ignore[assignment]  # 只换传输层，其余逻辑保持真实
         base_url_getter=lambda: ctx.settings.base_url,
         api_key_getter=ctx.secrets.get_api_key,
         redactor=ctx.redactor,

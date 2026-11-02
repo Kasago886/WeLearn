@@ -237,7 +237,7 @@ def test_v6_settings_columns_are_added_and_keep_existing_rows(tmp_path: Path) ->
 def test_v6_columns_exist_on_fresh_database(tmp_path: Path) -> None:
     db = Database.from_path(tmp_path / "fresh.db")
     try:
-        assert db.init() == 7
+        assert db.init() == SCHEMA_VERSION
         assert set(V6_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
     finally:
         db.dispose()
@@ -247,7 +247,7 @@ def test_v7_columns_exist_on_fresh_database(tmp_path: Path) -> None:
     """v7：复习排期、日志保留、访问口令与工具开关。"""
     db = Database.from_path(tmp_path / "fresh.db")
     try:
-        assert db.init() == 7
+        assert db.init() == SCHEMA_VERSION
         assert set(V7_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
         assert set(V7_NODE_COLUMNS) <= column_names(db, "knowledge_point")
     finally:
@@ -267,7 +267,7 @@ def test_v7_upgrades_old_settings_row(tmp_path: Path) -> None:
         for column in V7_SETTINGS_COLUMNS:
             assert column not in column_names(db, "app_settings")
 
-        assert db.init() == 7
+        assert db.init() == SCHEMA_VERSION
         assert set(V7_SETTINGS_COLUMNS) <= column_names(db, "app_settings")
 
         service = SettingsService(db, {"WELEARN_DATA_DIR": str(tmp_path)})
@@ -277,6 +277,29 @@ def test_v7_upgrades_old_settings_row(tmp_path: Path) -> None:
         assert settings.log_retention_days == 14
         assert settings.access_token_hash == ""
         assert settings.tools_enabled is False
+    finally:
+        db.dispose()
+
+
+def test_v8_provider_column_is_added_and_keeps_existing_behaviour(tmp_path: Path) -> None:
+    """v8：接口类型列补到老库上，且**老库升级后行为不变**（默认仍是 DeepSeek）。
+
+    这条断言是这次改动的安全底线：升级不能把用户在用得好好的 DeepSeek 配置
+    悄悄切成"通用 OpenAI 兼容"，那会让思考开关与缓存统计莫名失效。
+    """
+    db = Database.from_path(tmp_path / "old.db")
+    try:
+        db.init()
+        with db.engine.begin() as connection:
+            connection.execute(text("ALTER TABLE app_settings DROP COLUMN provider"))
+
+        assert "provider" not in column_names(db, "app_settings")
+
+        assert db.init() == SCHEMA_VERSION
+        assert "provider" in column_names(db, "app_settings")
+
+        service = SettingsService(db, {"WELEARN_DATA_DIR": str(tmp_path)})
+        assert service.load().provider.value == "deepseek"
     finally:
         db.dispose()
 

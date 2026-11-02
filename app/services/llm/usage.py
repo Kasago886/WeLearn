@@ -15,10 +15,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.protocol import TokenUsage
 from app.infra.storage.db import Database
 from app.infra.storage.models import SubjectRow, UsageRecordRow
-from app.services.llm.cost import CostEstimate, combine, effective_price_table, estimate_cost
+from app.services.llm.cost import (
+    OFF_PEAK_MULTIPLIER,
+    CostEstimate,
+    combine,
+    effective_price_table,
+    estimate_cost,
+)
 
 # 聚合金额的保留位数：只用来抹掉浮点累加的尾巴（0.00035700000000000004），
 # 展示精度由前端决定，这里不做四舍五入到分。
@@ -131,7 +137,11 @@ def _cost_columns() -> list[Any]:
     ]
 
 
-def _cost_of_row(values: Sequence[Any], price_table: dict[str, dict[str, float]]) -> CostEstimate:
+def _cost_of_row(
+    values: Sequence[Any],
+    price_table: dict[str, dict[str, float]],
+    off_peak_multiplier: float,
+) -> CostEstimate:
     """按这一行**实际发生时刻**计价。"""
     return estimate_cost(
         model=str(values[0] or ""),
@@ -140,6 +150,7 @@ def _cost_of_row(values: Sequence[Any], price_table: dict[str, dict[str, float]]
         output_tokens=int(values[3] or 0),
         at=values[4],
         price_table=price_table,
+        off_peak_multiplier=off_peak_multiplier,
     )
 
 
@@ -260,6 +271,7 @@ class UsageRecorder:
         *,
         subject_id: str | None = None,
         price_table: dict[str, dict[str, float]] | None = None,
+        off_peak_multiplier: float = OFF_PEAK_MULTIPLIER,
     ) -> CostEstimate:
         """总费用估算（FR-706）。
 
@@ -275,13 +287,14 @@ class UsageRecorder:
         with self._db.session() as session:
             rows = session.execute(statement).all()
 
-        return _rounded(combine([_cost_of_row(tuple(row), table) for row in rows]))
+        return _rounded(combine([_cost_of_row(tuple(row), table, off_peak_multiplier) for row in rows]))
 
     def cost_by_purpose(
         self,
         *,
         subject_id: str | None = None,
         price_table: dict[str, dict[str, float]] | None = None,
+        off_peak_multiplier: float = OFF_PEAK_MULTIPLIER,
     ) -> dict[str, CostEstimate]:
         """按用途聚合费用，与 :meth:`by_purpose` 平行（FR-705、FR-706）。"""
         target = subject_id if subject_id is not None else self._subject_id
@@ -296,7 +309,7 @@ class UsageRecorder:
         grouped: dict[str, list[CostEstimate]] = {}
         for row in rows:
             values = tuple(row)
-            grouped.setdefault(str(values[0]), []).append(_cost_of_row(values[1:], table))
+            grouped.setdefault(str(values[0]), []).append(_cost_of_row(values[1:], table, off_peak_multiplier))
         return {purpose: _rounded(combine(items)) for purpose, items in grouped.items()}
 
     def cost_by_subject(
@@ -304,6 +317,7 @@ class UsageRecorder:
         *,
         limit: int = 10,
         price_table: dict[str, dict[str, float]] | None = None,
+        off_peak_multiplier: float = OFF_PEAK_MULTIPLIER,
     ) -> list[SubjectCost]:
         """按主题聚合费用并按金额降序取前 ``limit`` 个（FR-706）。
 
@@ -320,7 +334,7 @@ class UsageRecorder:
             grouped: dict[str, list[CostEstimate]] = {}
             for row in rows:
                 values = tuple(row)
-                grouped.setdefault(str(values[0]), []).append(_cost_of_row(values[1:], table))
+                grouped.setdefault(str(values[0]), []).append(_cost_of_row(values[1:], table, off_peak_multiplier))
             titles = _subject_titles(session, list(grouped))
 
         items = [

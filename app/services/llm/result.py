@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.protocol import TokenUsage
 
 TIMEOUT_MESSAGE = "请求超时，可点击重试或调大超时时间。"
 

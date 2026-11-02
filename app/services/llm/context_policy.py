@@ -1,9 +1,10 @@
-"""上下文成本策略（T1.7，FR-719、FR-720）。
+"""上下文成本策略（T1.7，FR-719、FR-720；P6 按接口类型决定是否回传思维链）。
 
 两条官方规则的落地：
 
 **FR-719 思维链回传**：请求**携带 `tools`** 时，历史轮次的 `reasoning_content` 必须回传并会被
-拼进上下文；不携带 `tools` 时官方会忽略它。因此这里按是否启用工具决定"保留还是剔除"——
+拼进上下文；不携带 `tools` 时官方会忽略它。这是 DeepSeek 的硬性要求，
+OpenAI 兼容服务不要求（有的还会拒绝），因此是否保留由接口类型决定（见 providers 档案）。
 剔除不改变模型看到的内容，但能显著减小请求体（思维链通常比正文长得多）。
 
 **FR-720 缓存友好**：官方上下文硬盘缓存只有**完整匹配缓存前缀单元**才计入命中，
@@ -31,14 +32,24 @@ def strip_reasoning(messages: Sequence[ProtocolMessage]) -> list[ProtocolMessage
     return stripped
 
 
-def build_outbound_messages(memory: Memory, *, tools_enabled: bool = False) -> list[ProtocolMessage]:
+def build_outbound_messages(
+    memory: Memory,
+    *,
+    tools_enabled: bool = False,
+    echo_reasoning: bool = True,
+) -> list[ProtocolMessage]:
     """构造发给模型的消息数组。
 
-    ``tools_enabled=True`` 时保留 ``reasoning_content``（官方要求回传），
-    否则剔除（官方会忽略，剔除只为减小请求体）。
+    ``echo_reasoning`` 由接口类型决定（见 :mod:`app.infra.llm.providers`）：
+    DeepSeek 在**请求携带 tools** 时要求回传历史思维链；OpenAI 兼容服务不要求，
+    且部分实现会拒绝输入消息里的 ``reasoning_content``——所以那里一律剔除。
+
+    两个条件同时成立才保留：``tools_enabled and echo_reasoning``。
+    其余情况剔除不改变模型看到的内容（不携带 tools 时思维链本就被忽略），
+    但能显著减小请求体。
     """
     messages = memory.outbound_messages()
-    return messages if tools_enabled else strip_reasoning(messages)
+    return messages if (tools_enabled and echo_reasoning) else strip_reasoning(messages)
 
 
 def stable_prefix_hash(messages: Sequence[ProtocolMessage]) -> str:

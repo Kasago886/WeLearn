@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import get_context, get_stack
 from app.contracts.schemas import LlmPurpose
 from app.infra.access import hash_token
+from app.infra.llm.providers import DEFAULT_PROVIDER, ProviderKind, profile_for, provider_options
 from app.infra.settings import AppSettings, PurposeOverride, purpose_overrides_payload
 from app.main_context import AppContext
 from app.services.learning.stack import LearningStack
@@ -24,6 +25,8 @@ router = APIRouter(prefix="/api", tags=["settings"])
 class SettingsRequest(BaseModel):
     """可保存的设置项。``data_dir`` 不在其中：它只由环境变量决定（改了会导致找不到数据库）。"""
 
+    # 接口类型（P6）：openai = 通用 OpenAI 兼容；deepseek = 额外开启思考开关/缓存统计/余额
+    provider: ProviderKind = DEFAULT_PROVIDER
     base_url: str = Field(min_length=1)
     model_default: str = Field(min_length=1)
     model_pro: str = Field(min_length=1)
@@ -68,7 +71,12 @@ class TestConnectionRequest(BaseModel):
 
 
 def _settings_payload(settings: AppSettings, ctx: AppContext, policy: ModelPolicy) -> dict[str, Any]:
+    profile = profile_for(settings.provider)
     return {
+        "provider": settings.provider.value,
+        # 只读：当前接口类型支持哪些能力，前端据此灰掉不生效的控件（P6）
+        "provider_capabilities": profile.capabilities(),
+        "provider_options": provider_options(),
         "base_url": settings.base_url,
         "model_default": settings.model_default,
         "model_pro": settings.model_pro,
@@ -106,6 +114,9 @@ def _settings_payload(settings: AppSettings, ctx: AppContext, policy: ModelPolic
         "model_plan": describe_model_plan(policy),
         # 数据目录只读；这两项告诉前端"哪些东西改了不生效"（FR-718）
         "read_only_fields": ["data_dir"],
+        # 被环境变量覆盖的字段：界面上的修改不会生效。不暴露它的话，
+        # 用户会以为"选了 OpenAI 兼容却还是 DeepSeek 的地址"是程序坏了
+        "env_overridden": ctx.settings_service.diagnostics().env_overridden,
         "api_key": {
             "configured": ctx.secrets.has_api_key(),
             "source": ctx.secrets.source(),
@@ -184,7 +195,7 @@ async def test_connection(
 @router.get("/models")
 async def list_models(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
     """可用模型与元数据（FR-702）：避免把模型名写死导致官方改版后失效。"""
-    from app.infra.deepseek.errors import LlmError
+    from app.infra.llm.errors import LlmError
 
     try:
         models = await ctx.llm.list_models()
@@ -244,7 +255,11 @@ def usage_summary(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
 
     recorder = UsageRecorder(ctx.db)
     summary = recorder.summary()
-    cost = recorder.cost_summary(price_table=ctx.settings.price_table)
+    cost = recorder.cost_summary(
+        price_table=ctx.settings.price_table,
+        # 空闲折扣只有 DeepSeek 有；其他接口类型按固定价算，否则金额会少一半（P6）
+        off_peak_multiplier=profile_for(ctx.settings.provider).off_peak_multiplier,
+    )
     return {
         "calls": summary.calls,
         "prompt_tokens": summary.prompt_tokens,

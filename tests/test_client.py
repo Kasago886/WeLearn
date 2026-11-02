@@ -11,9 +11,9 @@ import httpx
 import pytest
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.client import DeepSeekClient
-from app.infra.deepseek.errors import LlmError, LlmErrorCategory
-from app.infra.deepseek.protocol import SamplingOptions, StreamEvent
+from app.infra.llm.client import LlmClient
+from app.infra.llm.errors import LlmError, LlmErrorCategory
+from app.infra.llm.protocol import SamplingOptions, StreamEvent
 from app.infra.logging import queue_logger
 from app.infra.logging.queue_logger import QueueLogger
 from app.infra.redaction import Redactor
@@ -33,7 +33,7 @@ def _ok_blocking(content: str = "好的") -> httpx.Response:
     )
 
 
-async def _collect(client: DeepSeekClient, *, model: str = "deepseek-flash") -> list[StreamEvent]:
+async def _collect(client: LlmClient, *, model: str = "deepseek-flash") -> list[StreamEvent]:
     return [
         event
         async for event in client.stream_chat(

@@ -8,8 +8,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from app.infra.deepseek.client import DeepSeekClient
-from app.infra.deepseek.protocol import SamplingOptions
+from app.infra.llm.client import LlmClient
+from app.infra.llm.protocol import SamplingOptions
 from app.infra.logging.queue_logger import CHANNEL_APP, QueueLogger, configure_logger, get_logger
 from app.infra.paths import DataPaths
 from app.infra.redaction import Redactor
@@ -41,7 +41,7 @@ class AppContext:
     secrets: SecretStore
     redactor: Redactor
     logger: QueueLogger
-    llm: DeepSeekClient
+    llm: LlmClient
     # 用途策略是**唯一实例**：领域服务与 API 都读它，刷新时才不会有谁还在用旧设置
     policy: ModelPolicy
     memories: MemoryRepository
@@ -108,7 +108,7 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
 
     # 客户端通过 holder 读取设置，保证运行期修改即时生效
     holder: dict[str, AppSettings] = {"current": settings}
-    llm = DeepSeekClient(
+    llm = LlmClient(
         base_url_getter=lambda: holder["current"].base_url,
         api_key_getter=secrets.get_api_key,
         redactor=redactor,
@@ -117,6 +117,8 @@ def build_context(env: Mapping[str, str] | None = None) -> AppContext:
         # 环境变量与运行期开关**取或**：环境变量是排障时"一定能开"的兜底手段（FR-715）
         audit_getter=lambda: holder["current"].audit_enabled,
         sampling_getter=lambda: _sampling_options(holder),
+        # 接口类型同样现取：切换后下一次请求即按新档案组装（P6）
+        provider_getter=lambda: holder["current"].provider.value,
         log_payload=log_payload,
     )
 

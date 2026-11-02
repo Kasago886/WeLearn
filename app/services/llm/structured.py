@@ -18,8 +18,8 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError, LlmErrorCategory
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.errors import LlmError, LlmErrorCategory
+from app.infra.llm.protocol import TokenUsage
 from app.infra.logging.queue_logger import CHANNEL_LLM, get_logger
 from app.services.llm.agent import RoundExecutor
 

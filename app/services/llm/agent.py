@@ -20,9 +20,10 @@ working += 用户输入
 两条官方限制在这里的落点：
 
 1. **思考模式不支持 `tool_choice="required"` 与指定具体工具**——执行器从不下发
-   `tool_choice`，只把 `tools` 交给协议层（见 :mod:`app.infra.deepseek.protocol`）；
-2. **携带 `tools` 时历史轮次的 `reasoning_content` 必须回传**——因此只要持有工具，
-   :attr:`RoundExecutor.tools_enabled` 就为真，:func:`build_outbound_messages` 会保留思维链。
+   `tool_choice`，只把 `tools` 交给协议层（见 :mod:`app.infra.llm.protocol`）；
+2. **DeepSeek 在携带 `tools` 时要求历史轮次的 `reasoning_content` 必须回传**——因此只要持有工具，
+   :attr:`RoundExecutor.tools_enabled` 就为真，:func:`build_outbound_messages` 会按接口类型
+   决定是否保留思维链（OpenAI 兼容服务不要求，且可能拒收，见 :mod:`app.infra.llm.providers`）。
    这两件事必须同时成立，否则就是"带 tools 却不回传思维链"的自相矛盾状态，
    所以由 :attr:`tools_enabled` 的计算属性兜住，而不是让调用方记得传两个参数。
 """
@@ -34,9 +35,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.client import LlmClientProtocol
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import StreamEvent, TokenUsage, ToolCall
+from app.infra.llm.client import LlmClientProtocol
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import StreamEvent, TokenUsage, ToolCall
 from app.infra.logging.queue_logger import CHANNEL_LLM, get_logger
 from app.services.llm.context_policy import build_outbound_messages
 from app.services.llm.memory import (
@@ -127,6 +128,7 @@ class RoundExecutor:
         *,
         on_usage: UsageCallback | None = None,
         tools_enabled: bool = False,
+        echo_reasoning: bool = True,
         conversation_id: str | None = None,
         tools: ToolRegistry | None = None,
     ) -> None:
@@ -135,6 +137,7 @@ class RoundExecutor:
         self._policy = policy
         self._on_usage = on_usage
         self._tools_enabled = tools_enabled
+        self._echo_reasoning = echo_reasoning
         self._conversation_id = conversation_id
         self._tools = tools
         self._log = get_logger(CHANNEL_LLM)
@@ -169,6 +172,7 @@ class RoundExecutor:
             self._policy,
             on_usage=self._on_usage,
             tools_enabled=self._tools_enabled,
+            echo_reasoning=self._echo_reasoning,
             conversation_id=self._conversation_id,
             tools=tools,
         )
@@ -181,6 +185,7 @@ class RoundExecutor:
             self._policy,
             on_usage=self._on_usage,
             tools_enabled=self._tools_enabled,
+            echo_reasoning=self._echo_reasoning,
             conversation_id=self._conversation_id,
             tools=self._tools,
         )
@@ -234,7 +239,11 @@ class RoundExecutor:
 
                 # 到达上限后不再给工具：逼模型把已有信息组织成正文，避免无限循环
                 use_tools = tool_specs if (tool_specs is not None and tool_rounds < MAX_TOOL_ROUNDS) else None
-                messages = build_outbound_messages(working, tools_enabled=self.tools_enabled)
+                messages = build_outbound_messages(
+                    working,
+                    tools_enabled=self.tools_enabled,
+                    echo_reasoning=self._echo_reasoning,
+                )
                 capture = _RoundCapture()
 
                 async for event in self._client.stream_chat(
@@ -353,7 +362,11 @@ class RoundExecutor:
         try:
             while True:
                 use_tools = tool_specs if (tool_specs is not None and tool_rounds < MAX_TOOL_ROUNDS) else None
-                messages = build_outbound_messages(working, tools_enabled=self.tools_enabled)
+                messages = build_outbound_messages(
+                    working,
+                    tools_enabled=self.tools_enabled,
+                    echo_reasoning=self._echo_reasoning,
+                )
                 result = await self._client.chat(
                     model=choice.model,
                     messages=messages,

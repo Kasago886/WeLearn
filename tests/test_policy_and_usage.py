@@ -1,7 +1,7 @@
 """用途策略与用量落库测试（T1.7、FR-703、FR-705）。"""
 
 from app.contracts.schemas import LlmPurpose, ReasoningEffort
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.protocol import TokenUsage
 from app.infra.settings import AppSettings, PurposeOverride
 from app.infra.storage.models import UsageRecordRow
 from app.main_context import AppContext

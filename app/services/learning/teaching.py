@@ -52,7 +52,7 @@ from app.contracts.schemas import (
     Verdict,
     WeakPointReason,
 )
-from app.infra.deepseek.protocol import StreamEvent
+from app.infra.llm.protocol import StreamEvent
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.infra.settings import AppSettings
 from app.infra.storage.models import utcnow

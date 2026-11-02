@@ -3,6 +3,9 @@
 余额是**辅助信息**：查不到不能挡住任何主流程，所以失败一律是 ``200 + ok=false``，
 而不是 4xx/5xx——前端据此决定"显示余额"还是"显示原因"，不必为可选能力写错误分支。
 
+余额接口本身是 **DeepSeek 特有**的（P6）。接口类型为 OpenAI 兼容时直接返回
+``category="unsupported"``，而不是去请求一个必然 404 的路径再翻译错误。
+
 官方金额是**字符串**（如 ``"17.39"``），这里原样透传：``float`` 会在往返中丢精度，
 而金额恰恰是最不能出错的地方（``docs/接口契约变更记录.md`` §4 记录的真实响应）。
 """
@@ -13,7 +16,8 @@ from typing import Any
 from fastapi import APIRouter, Depends
 
 from app.api.deps import get_context
-from app.infra.deepseek.errors import LlmError
+from app.infra.llm.errors import LlmError
+from app.infra.llm.providers import profile_for
 from app.infra.logging.queue_logger import CHANNEL_APP
 from app.main_context import AppContext
 
@@ -75,6 +79,13 @@ def _failure_payload(category: str, message: str) -> dict[str, Any]:
 @router.get("/balance")
 async def get_balance(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
     """查询账户余额（FR-710）。任何失败都返回 200，绝不影响主流程。"""
+    # 余额是 DeepSeek 特有的接口：当前接口类型没有它时直接说明，不去请求一个必然 404 的路径
+    if profile_for(ctx.settings.provider).balance_path is None:
+        return _failure_payload(
+            "unsupported",
+            "当前接口类型不提供余额查询；如需查看余额请到对应平台的账单页。",
+        )
+
     try:
         body = await ctx.llm.get_balance()
         info = _first_balance_info(body)

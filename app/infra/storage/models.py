@@ -40,6 +40,8 @@ class AppSettingsRow(Base):
     __tablename__ = "app_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # v8：接口类型（P6）。空值按默认处理，与其余列同一规则
+    provider: Mapped[str | None] = mapped_column(String(16))
     base_url: Mapped[str | None] = mapped_column(String(300))
     model_default: Mapped[str | None] = mapped_column(String(120))
     model_pro: Mapped[str | None] = mapped_column(String(120))

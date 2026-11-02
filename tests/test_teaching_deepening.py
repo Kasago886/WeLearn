@@ -1,4 +1,4 @@
-﻿"""教学深化测试（T3.2，FR-407、FR-411、FR-413）。
+"""教学深化测试（T3.2，FR-407、FR-411、FR-413）。
 
 三块能力，各自的核心不变量：
 
@@ -205,7 +205,7 @@ async def test_hint_records_last_action(context: AppContext) -> None:
 
 
 async def test_hint_propagates_failure_without_side_effects(context: AppContext) -> None:
-    from app.infra.deepseek.errors import LlmError
+    from app.infra.llm.errors import LlmError
 
     harness = make_harness(context)
     teaching, subject_id = setup(harness)

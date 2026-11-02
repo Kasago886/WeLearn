@@ -5,7 +5,7 @@
 **官方限制决定了这里的形状**：
 
 1. 思考模式下不支持 `tool_choice = "required"`，也不支持指定具体某个工具（服务端返回 400），
-   因此请求体里**从不携带 `tool_choice`**（见 :func:`app.infra.deepseek.protocol.build_chat_request`）。
+   因此请求体里**从不携带 `tool_choice`**（见 :func:`app.infra.llm.protocol.build_chat_request`）。
    代价是模型只能"自愿"调用工具，所以每个工具的 ``description`` 必须把
    "什么时候该用"说清楚，否则模型不会去用；
 2. 请求携带 `tools` 时，历史轮次的 `reasoning_content` 必须回传并会拼进上下文——
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.schemas import WeakPointReason
-from app.infra.deepseek.protocol import ToolCall
+from app.infra.llm.protocol import ToolCall
 from app.services.learning.entities import KnowledgePoint
 from app.services.learning.repository import DomainRepositories
 

@@ -8,11 +8,13 @@
 每个会话对应一个 :class:`ConversationKind`，因此测评与教学的记忆天然隔离（FR-602、FR-209）。
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.contracts.schemas import ConversationKind, LlmPurpose
-from app.infra.deepseek.client import DeepSeekClient
-from app.infra.deepseek.protocol import TokenUsage
+from app.infra.llm.client import LlmClient
+from app.infra.llm.protocol import TokenUsage
+from app.infra.llm.providers import profile_for
 from app.services.llm.agent import RoundExecutor
 from app.services.llm.judge import Judge
 from app.services.llm.memory import Memory
@@ -55,13 +57,14 @@ class ConversationSessionFactory:
 
     def __init__(
         self,
-        client: DeepSeekClient,
+        client: LlmClient,
         memories: MemoryRepository,
         usage: UsageRecorder,
         policy: ModelPolicy,
         *,
         max_retries: int = 2,
         tools_enabled: bool = False,
+        provider_getter: Callable[[], str] | None = None,
     ) -> None:
         self._client = client
         self._memories = memories
@@ -69,6 +72,13 @@ class ConversationSessionFactory:
         self._policy = policy
         self._max_retries = max_retries
         self._tools_enabled = tools_enabled
+        # 接口类型在**每次开会话时**现取：设置页切换后，下一轮就按新档案处理思维链
+        self._provider_getter = provider_getter
+
+    def _echo_reasoning(self) -> bool:
+        """是否必须回传历史思维链（DeepSeek 有要求，OpenAI 兼容服务不需要）。"""
+        kind = self._provider_getter() if self._provider_getter is not None else None
+        return profile_for(kind).echo_reasoning_with_tools
 
     def open(self, subject_id: str, kind: ConversationKind) -> ConversationSession:
         """载入（或新建）会话。"""
@@ -97,6 +107,7 @@ class ConversationSessionFactory:
             self._policy,
             on_usage=on_usage,
             tools_enabled=self._tools_enabled,
+            echo_reasoning=self._echo_reasoning(),
         )
         return ConversationSession(
             conversation_id=conversation_id,

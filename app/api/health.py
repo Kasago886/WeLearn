@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from sqlalchemy import text
 
+from app.infra.llm.providers import profile_for
 from app.main_context import AppContext
 from app.services.llm.usage import UsageRecorder
 
@@ -96,6 +97,7 @@ def health(request: Request) -> dict[str, Any]:
         "problems": problems,
         "storage": storage,
         "model": {
+            "provider": settings.provider.value,
             "base_url": settings.base_url,
             "default": settings.model_default,
             "pro": settings.model_pro,
@@ -103,6 +105,7 @@ def health(request: Request) -> dict[str, Any]:
             "reasoning_effort": settings.reasoning_effort.value,
             "max_tokens": settings.max_tokens,
             "timeout_seconds": settings.timeout_seconds,
+            "capabilities": profile_for(settings.provider).capabilities(),
         },
         "api_key": api_key,
         "logging": {

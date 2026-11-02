@@ -23,8 +23,8 @@ import httpx  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from app.contracts.schemas import LlmPurpose  # noqa: E402
-from app.infra.deepseek.errors import LlmError  # noqa: E402
-from app.infra.deepseek.protocol import (  # noqa: E402
+from app.infra.llm.errors import LlmError  # noqa: E402
+from app.infra.llm.protocol import (  # noqa: E402
     BALANCE_PATH,
     CHAT_COMPLETIONS_PATH,
     MODELS_PATH,

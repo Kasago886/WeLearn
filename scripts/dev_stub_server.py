@@ -1,4 +1,4 @@
-﻿"""本地联调用的假 LLM 服务端（p2-web-scaffold 的配套工具）。
+"""本地联调用的假 LLM 服务端（p2-web-scaffold 的配套工具）。
 
 **为什么需要它**：前端最需要验证的是"接口层 + 流式渲染"这一整条链路，而不是模型输出质量。
 用真实 API 调试前端，每点一次按钮都要花钱、要等、还不稳定；这里把 LLM 换成按提示词识别的
@@ -30,7 +30,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.protocol import BlockingResult, StreamEvent, TokenUsage, ToolCall
+from app.infra.llm.protocol import BlockingResult, StreamEvent, TokenUsage, ToolCall
 from app.main import create_app
 from app.services.learning.stack import build_learning_stack
 
@@ -162,7 +162,7 @@ HEADINGS: tuple[tuple[str, str], ...] = (
 
 
 class StubClient:
-    """按提示词内容返回固定内容；接口签名与 DeepSeekClient 一致。"""
+    """按提示词内容返回固定内容；接口签名与 LlmClient 一致。"""
 
     def __init__(self) -> None:
         self.stream_calls = 0
@@ -290,7 +290,7 @@ class StubClient:
         )
 
     async def test_connection(self, *, model: str) -> Any:
-        from app.infra.deepseek.client import ConnectionTestResult
+        from app.infra.llm.client import ConnectionTestResult
 
         return ConnectionTestResult(ok=True, message="桩服务：连接正常", category=None, latency_ms=1)
 

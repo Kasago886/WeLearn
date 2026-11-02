@@ -5,8 +5,8 @@ import asyncio
 import pytest
 
 from app.contracts.schemas import LlmPurpose
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import StreamEvent, TokenUsage
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import StreamEvent, TokenUsage
 from app.infra.settings import AppSettings
 from app.services.llm.agent import RoundExecutor, StopSignal
 from app.services.llm.memory import CONTENT_KEY, REASONING_KEY, ROLE_KEY, Memory, user_message

@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from app.contracts.schemas import WeakPointReason
-from app.infra.deepseek.protocol import (
+from app.infra.llm.protocol import (
     BlockingResult,
     StreamEvent,
     ToolCall,

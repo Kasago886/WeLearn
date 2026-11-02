@@ -18,8 +18,8 @@ from app.contracts.events import (
     SseEventType,
     encode_frame,
 )
-from app.infra.deepseek.errors import LlmError
-from app.infra.deepseek.protocol import StreamEvent
+from app.infra.llm.errors import LlmError
+from app.infra.llm.protocol import StreamEvent
 from app.infra.logging.queue_logger import CHANNEL_APP, get_logger
 from app.services.learning.planning import PlanningError
 from app.services.learning.state import AnswerNotAllowedError
