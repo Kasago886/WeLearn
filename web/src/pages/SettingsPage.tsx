@@ -9,6 +9,9 @@ import type {
   LogStats,
   ModelInfo,
   ModelPick,
+  ProviderCapabilities,
+  ProviderKind,
+  ProviderOption,
   PurposeOverride,
   Settings,
   TestConnectionResult,
@@ -82,6 +85,15 @@ const EFFORT_PICK_LABELS: Record<EffortPick, string> = {
   low: 'low',
   high: 'high',
   max: 'max',
+}
+
+/** 会被环境变量覆盖的字段名 → 界面上的中文名（只列模型相关，其余不影响切换接口）。 */
+const FIELD_LABELS: Record<string, string> = {
+  provider: '接口类型',
+  base_url: '接口地址',
+  model_default: '默认模型',
+  model_pro: '深度模型',
+  log_level: '日志级别',
 }
 
 function formatDuration(durationMs: number): string {
@@ -237,6 +249,14 @@ export function SettingsPage() {
 
   const editable = draft.read_only_fields
   const modelOptions: ModelInfo[] = models.data?.items ?? []
+  const providerOptions: ProviderOption[] = draft.provider_options ?? []
+  const currentProvider = providerOptions.find((item) => item.value === draft.provider)
+  // 能力取"所选接口类型"那一项，而不是服务端快照里的当前值：
+  // 用户在下拉框里切了还没保存时，提示必须立刻跟着变，否则会看到一套自相矛盾的说明
+  const caps: ProviderCapabilities = currentProvider?.capabilities ?? draft.provider_capabilities
+  // 环境变量覆盖会盖住界面修改（FR-707 的优先级规则），不把这件事说出来，
+  // 用户会以为"选了 OpenAI 兼容却还是 DeepSeek 的地址"是程序坏了
+  const envOverridden = (draft.env_overridden ?? []).filter((name) => FIELD_LABELS[name] !== undefined)
 
   function patch(changes: Partial<Settings>): void {
     // 草稿的初始 state 是 null（此时界面上显示的是服务端快照），
@@ -303,7 +323,44 @@ export function SettingsPage() {
 
       <div className="card">
         <h2>模型与 API Key</h2>
+        {envOverridden.length > 0 ? (
+          <Banner tone="notice">
+            以下设置由环境变量决定，界面上的修改不会生效：
+            {envOverridden.map((name) => FIELD_LABELS[name] ?? name).join('、')}
+            。要在这里修改，请先去掉 .env（或系统环境变量）中对应的 WELEARN_* 变量。
+          </Banner>
+        ) : null}
         <div className="form-grid">
+          <div className="field">
+            <label htmlFor="provider">接口类型</label>
+            <select
+              id="provider"
+              value={draft.provider}
+              disabled={busy}
+              onChange={(event) => {
+                const next = event.target.value as ProviderKind
+                const option = providerOptions.find((item) => item.value === next)
+                const previous = providerOptions.find((item) => item.value === draft.provider)
+                // 地址还是"上一个接口的默认值"时顺手换成新接口的默认值；
+                // 用户自己填过的地址一律不动（否则切一下接口就把自建网关地址冲掉了）
+                const untitled = !draft.base_url.trim() || draft.base_url.trim() === previous?.default_base_url
+                patch({
+                  provider: next,
+                  ...(untitled && option ? { base_url: option.default_base_url } : {}),
+                })
+              }}
+            >
+              {providerOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <span className="hint">
+              OpenAI 兼容只发标准字段；DeepSeek 额外启用思考开关、缓存统计、余额查询与空闲半价。
+              切换后请把下面的模型名改成该服务支持的名称（可点「刷新模型列表」查看）。
+            </span>
+          </div>
           <div className="field">
             <label htmlFor="base_url">接口地址（base_url）</label>
             <input
@@ -311,7 +368,9 @@ export function SettingsPage() {
               value={draft.base_url}
               onChange={(event) => patch({ base_url: event.target.value })}
             />
-            <span className="hint">默认 https://api.deepseek.com，可保留子路径（如 /v1）。</span>
+            <span className="hint">
+              默认 {currentProvider?.default_base_url ?? 'https://api.deepseek.com'}；可保留子路径（如 /v1）。
+            </span>
           </div>
           <div className="field">
             <label htmlFor="model_default">默认模型</label>
@@ -362,7 +421,11 @@ export function SettingsPage() {
               <option value="high">high</option>
               <option value="max">max</option>
             </select>
-            <span className="hint">仅在思考模式开启时下发。</span>
+            <span className="hint">
+              {caps.thinking_switch
+                ? '仅思考模式开启时下发。'
+                : '当前接口不下发思考开关，仅在开启时通过 reasoning_effort 表达推理强度。'}
+            </span>
           </div>
           <div className="field">
             <label htmlFor="show_reasoning">展示思维链</label>
@@ -723,8 +786,10 @@ export function SettingsPage() {
       <div className="card">
         <h2>成本估算与余额</h2>
         <p className="muted small">
-          单价单位是「元 / 百万 token」，填的是**高峰价**；空闲时段（工作日 9:00–12:00、14:00–18:00
-          之外，含周末）官方按半价计费，估算会自动打折（FR-706）。
+          单价单位是「元 / 百万 token」，填的是**高峰价**。
+          {caps.off_peak_pricing
+            ? '空闲时段（工作日 9:00–12:00、14:00–18:00 之外，含周末）官方按半价计费，估算会自动打折（FR-706）。'
+            : '当前接口类型按固定价结算（无空闲折扣），填多少就是多少。'}
         </p>
         <table className="table">
           <thead>
@@ -777,13 +842,15 @@ export function SettingsPage() {
           <div>
             <strong className="small">账户余额</strong>
             <p className="muted small" style={{ margin: 0 }}>
-              需要已配置 API Key；查询失败不会影响学习功能（FR-710）。
+              {caps.balance
+                ? '需要已配置 API Key；查询失败不会影响学习功能（FR-710）。'
+                : '当前接口类型不提供余额接口，请到对应平台的账单页查看。'}
             </p>
           </div>
           <button
             type="button"
             className="btn"
-            disabled={busy}
+            disabled={busy || !caps.balance}
             onClick={() => {
               setBusy(true)
               void settingsApi

@@ -362,7 +362,39 @@ export interface ModelChoice {
   reasoning_effort: string
 }
 
+export interface ProviderCapabilities {
+  /** 是否下发 `thinking` 开关（只有 DeepSeek 认这个字段）。 */
+  thinking_switch: boolean
+  /** 是否下发 `reasoning_effort`。 */
+  reasoning_effort: boolean
+  /** 是否有余额查询接口。 */
+  balance: boolean
+  /** 是否能拿到缓存命中 token。 */
+  cache_stats: boolean
+  /** `/models` 是否带上下文窗口等元数据。 */
+  model_metadata: boolean
+  /** 是否有空闲时段半价。 */
+  off_peak_pricing: boolean
+  /** 携带 tools 时是否要求回传历史思维链。 */
+  reasoning_echo_with_tools: boolean
+}
+
+export type ProviderKind = 'openai' | 'deepseek'
+
+export interface ProviderOption {
+  value: ProviderKind
+  label: string
+  default_base_url: string
+  capabilities: ProviderCapabilities
+}
+
 export interface Settings {
+  /** 接口类型（P6）：决定下发哪些参数、怎么解析响应。 */
+  provider: ProviderKind
+  /** 只读：当前接口类型支持的能力，界面据此调整提示与可用性。 */
+  provider_capabilities: ProviderCapabilities
+  /** 只读：可选接口类型及其默认地址。 */
+  provider_options: ProviderOption[]
   base_url: string
   model_default: string
   model_pro: string
@@ -402,6 +434,8 @@ export interface Settings {
   log_level: string
   data_dir: string
   read_only_fields: string[]
+  /** 被环境变量覆盖的字段名：界面上的修改不会生效（环境变量优先，FR-707）。 */
+  env_overridden: string[]
   api_key: { configured: boolean; source: string; masked: string | null }
 }
 
